@@ -18,7 +18,7 @@ FMP_KEY      = os.environ.get("FMP_KEY",      "U87EgtNaQOdshmSkc0IgEtCFcgqTDjvy"
 FINNHUB_KEY  = os.environ.get("FINNHUB_KEY",  "d8cf7k9r01qidic7msv0d8cf7k9r01qidic7msvg")
 TG_TOKEN     = os.environ.get("TG_TOKEN",     "")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID",   "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+ANTHROPIC_KEY = os.environ.get("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", "")
 
 ET = pytz.timezone("America/New_York")
 now_et = datetime.now(ET)
