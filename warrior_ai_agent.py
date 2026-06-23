@@ -284,15 +284,40 @@ def get_yahoo_data(symbol):
         year_high    = float(meta_d.get("fiftyTwoWeekHigh", 0) or (max(closes) if closes else 0))
         year_low     = float(meta_d.get("fiftyTwoWeekLow",  0) or (min(closes) if closes else 0))
 
-        # Fallback FMP pour float
+        # Fallback 1 — Yahoo Finance quote (v10) pour float
         if float_shares == 0:
             try:
-                fmp_url = f"https://financialmodelingprep.com/api/v3/shares_float?symbol={symbol}&apikey={FMP_KEY}"
-                fmp_r   = requests.get(fmp_url, timeout=3).json()
-                if isinstance(fmp_r, list) and fmp_r:
-                    float_shares = float(fmp_r[0].get("floatShares", 0) or 0)
+                url_q = (
+                    f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+                    f"?modules=defaultKeyStatistics"
+                )
+                rq = requests.get(url_q, headers=headers, timeout=4).json()
+                ks = (
+                    rq.get("quoteSummary", {})
+                      .get("result", [{}])[0]
+                      .get("defaultKeyStatistics", {})
+                )
+                float_shares = float(ks.get("floatShares", {}).get("raw", 0) or 0)
+                if float_shares:
+                    print(f"  ✓ Float Yahoo quoteSummary: {float_shares/1e6:.1f}M")
             except Exception:
                 pass
+
+        # Fallback 2 — Finnhub profile2 (gratuit, pas de 403)
+        if float_shares == 0 and FINNHUB_KEY:
+            try:
+                fh_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_KEY}"
+                fh_r   = requests.get(fh_url, timeout=4).json()
+                # shareOutstanding est en millions chez Finnhub
+                outstanding = float(fh_r.get("shareOutstanding", 0) or 0)
+                if outstanding:
+                    float_shares = outstanding * 1_000_000
+                    print(f"  ✓ Float Finnhub profile2: {outstanding:.1f}M")
+            except Exception:
+                pass
+
+        if float_shares == 0:
+            print(f"  ⚠ Float introuvable pour {symbol} — sera affiché N/A")
 
         # Intraday temps réel + pre-market
         url_rt = (
@@ -581,18 +606,48 @@ Réponds UNIQUEMENT avec le JSON, rien d'autre."""
             },
             timeout=30
         )
-        if r.status_code == 200:
-            content = r.json()["content"][0]["text"].strip()
-            if content.startswith("```"):
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            return json.loads(content)
-        else:
-            print(f"  ⚠ Claude API {r.status_code}: {r.text[:100]}")
+        print(f"  🤖 Claude API → HTTP {r.status_code}")
+
+        if r.status_code != 200:
+            print(f"  ⚠ Claude API erreur {r.status_code}: {r.text[:300]}")
             return None
+
+        raw_json = r.json()
+        if not raw_json.get("content"):
+            print(f"  ⚠ Claude réponse vide: {str(raw_json)[:200]}")
+            return None
+
+        content = raw_json["content"][0]["text"].strip()
+        print(f"  🤖 Claude réponse brute ({len(content)} chars): {content[:120]}...")
+
+        # Nettoyage robuste des backticks markdown
+        if "```" in content:
+            parts = content.split("```")
+            # Chercher le bloc JSON entre backticks
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    content = part
+                    break
+
+        # Trouver le JSON même si du texte précède/suit
+        start = content.find("{")
+        end   = content.rfind("}") + 1
+        if start != -1 and end > start:
+            content = content[start:end]
+
+        parsed = json.loads(content)
+        print(f"  ✅ Claude analyse OK — conviction={parsed.get('conviction')} reco={parsed.get('recommendation')}")
+        return parsed
+
+    except json.JSONDecodeError as e:
+        print(f"  ⚠ Claude JSON invalide pour {symbol}: {e}")
+        print(f"  ⚠ Contenu reçu: {content[:300] if 'content' in dir() else 'N/A'}")
+        return None
     except Exception as e:
-        print(f"  ⚠ Analyse AI {symbol}: {e}")
+        print(f"  ⚠ Analyse AI {symbol}: {type(e).__name__}: {e}")
         return None
 
 
@@ -607,7 +662,8 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
     gap     = stock_data["gap"]
     rvol    = stock_data["rvol"]
     float_m = stock_data["float_m"]
-    tv_link = f"https://www.tradingview.com/chart/?symbol={symbol}"
+    tv_link   = f"https://www.tradingview.com/chart/?symbol={symbol}"
+    float_str = f"{float_m:.1f}M" if float_m > 0 else "N/A"
 
     if ai_analysis:
         conviction  = ai_analysis.get("conviction", 0)
@@ -637,7 +693,7 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
             f"  💰 Prix : <b>${price:.2f}</b>\n"
             f"  📈 Gap : <b>+{gap:.1f}%</b>  Var : <b>+{var:.1f}%</b>\n"
             f"  ⚡ RVOL : <b>{rvol:.1f}x</b>\n"
-            f"  🎯 Float : <b>{float_m:.1f}M</b> actions\n\n"
+            f"  🎯 Float : <b>{float_str}</b> actions\n\n"
             f"<b>🔬 Setup :</b> {setup_type}\n\n"
             f"<b>📰 Catalyst :</b> {cat_quality}\n{cat_summary}\n\n"
         )
@@ -676,7 +732,7 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
             f"  💰 Prix : ${price:.2f}\n"
             f"  📈 Gap : +{gap:.1f}%  Var : +{var:.1f}%\n"
             f"  ⚡ RVOL : {rvol:.1f}x\n"
-            f"  🎯 Float : {float_m:.1f}M\n\n"
+            f"  🎯 Float : {float_str}\n\n"
         )
         if news:
             msg += "<b>📰 News :</b>\n"
@@ -785,9 +841,10 @@ else:
         conv = ai.get("conviction", 0) if ai else 0
         reco = ai.get("recommendation", "?") if ai else "?"
         emoji = "🔥" if conv >= 8 else "✅" if conv >= 6 else "📊"
+        float_disp = f"{s['float_m']:.1f}M" if s['float_m'] > 0 else "N/A"
         summary_lines.append(
             f"{emoji} <b>{s['symbol']}</b> — {conv}/10 — {reco}\n"
-            f"   +{s['variation']:.1f}% | RVOL {s['rvol']:.1f}x | Float {s['float_m']:.1f}M"
+            f"   +{s['variation']:.1f}% | RVOL {s['rvol']:.1f}x | Float {float_disp}"
         )
 
     send_telegram(
