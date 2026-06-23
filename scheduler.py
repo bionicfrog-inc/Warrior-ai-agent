@@ -19,7 +19,7 @@ SCAN_TIMES = [
     "08:00",  # 1h30 avant ouverture — meilleur moment
     "08:30",  # 1h avant ouverture
     "09:00",  # 30 min avant ouverture
-    "10:23",
+    "12:30",
 ]
 
 print("⚔️ WARRIOR AI SCHEDULER démarré")
