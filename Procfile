@@ -1,1 +1,1 @@
-web: python scheduler.py
+web: python warrior_ai_agent.py
