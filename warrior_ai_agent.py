@@ -14,22 +14,22 @@ import pytz
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-FMP_KEY      = os.environ.get("FMP_KEY",      "U87EgtNaQOdshmSkc0IgEtCFcgqTDjvy")
-FINNHUB_KEY  = os.environ.get("FINNHUB_KEY",  "d8cf7k9r01qidic7msv0d8cf7k9r01qidic7msvg")
-TG_TOKEN     = os.environ.get("TG_TOKEN",     "")
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID",   "")
+FMP_KEY       = os.environ.get("FMP_KEY",       "U87EgtNaQOdshmSkc0IgEtCFcgqTDjvy")
+FINNHUB_KEY   = os.environ.get("FINNHUB_KEY",   "d8cf7k9r01qidic7msv0d8cf7k9r01qidic7msvg")
+TG_TOKEN      = os.environ.get("TG_TOKEN",      "")
+TG_CHAT_ID    = os.environ.get("TG_CHAT_ID",    "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
 
 ET = pytz.timezone("America/New_York")
 now_et = datetime.now(ET)
 
 # Critères pre-market
-MIN_PRIX    = 0.50
-MAX_PRIX    = 20.0
-MIN_GAP     = 5.0      # Gap minimum +5% pre-market
-MIN_VOL     = 50_000   # Volume pre-market minimum
-MAX_FLOAT   = 50.0     # Float max 50M
-TOP_N       = 5        # Top 5 stocks analysés par l'AI
+MIN_PRIX  = 0.50
+MAX_PRIX  = 20.0
+MIN_GAP   = 5.0      # Gap minimum +5%
+MIN_VOL   = 50_000   # Volume minimum (appliqué sur données Yahoo, pas FMP Gainers)
+MAX_FLOAT = 50.0     # Float max 50M
+TOP_N     = 5        # Top 5 stocks analysés
 
 print("=" * 60)
 print("  ⚔️  WARRIOR AI AGENT — PRE-MARKET")
@@ -70,21 +70,34 @@ def get_premarket_gappers():
     print("\n  📡 Scan pre-market en cours...")
     candidates = []
 
-    # Source 1 — FMP Pre-Market
+    # ── Source 1 — FMP Pre-Market Most Active ──────────────────────────
+    # FIX: l'ancien endpoint /api/v3/pre-market-stocks n'existe pas.
+    # On utilise /api/v4/pre-market-most-active (actif avant 9h30 ET).
     try:
-        url  = f"https://financialmodelingprep.com/api/v3/pre-market-stocks?apikey={FMP_KEY}"
-        data = requests.get(url, timeout=10).json()
-        if isinstance(data, list):
+        url = f"https://financialmodelingprep.com/api/v4/pre-market-most-active?apikey={FMP_KEY}"
+        r   = requests.get(url, timeout=10)
+        print(f"  FMP Pre-Market Most Active → HTTP {r.status_code}")
+
+        data = r.json()
+        if not isinstance(data, list):
+            print(f"  ⚠ FMP Pre-Market réponse inattendue: {str(data)[:200]}")
+        else:
+            print(f"  FMP Pre-Market raw → {len(data)} entrées")
             for s in data:
                 symbol = s.get("symbol", "")
                 price  = float(s.get("price", 0) or 0)
                 change = float(s.get("changesPercentage", 0) or 0)
                 volume = int(s.get("volume", 0) or 0)
-                if (symbol and len(symbol) <= 5
-                        and MIN_PRIX <= price <= MAX_PRIX
-                        and change >= MIN_GAP
-                        and volume >= MIN_VOL
-                        and not any(symbol.endswith(x) for x in ["W","U","R"])):
+
+                passed = (
+                    symbol
+                    and len(symbol) <= 5
+                    and MIN_PRIX <= price <= MAX_PRIX
+                    and change >= MIN_GAP
+                    and volume >= MIN_VOL
+                    and not any(symbol.endswith(x) for x in ["W", "U", "R"])
+                )
+                if passed:
                     candidates.append({
                         "symbol": symbol,
                         "price":  price,
@@ -92,38 +105,102 @@ def get_premarket_gappers():
                         "volume": volume,
                         "source": "FMP Pre-Market"
                     })
-            print(f"  FMP Pre-Market → {len(candidates)} gappers")
-    except Exception as e:
-        print(f"  ⚠ FMP Pre-Market: {e}")
+                else:
+                    # Log des rejets pour debug
+                    print(f"    ✗ {symbol or '?'} rejeté — price={price:.2f} chg={change:.1f}% vol={volume:,}")
 
-    # Source 2 — FMP Gainers
-    try:
-        url  = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={FMP_KEY}"
-        data = requests.get(url, timeout=8).json()
-        if isinstance(data, list):
-            existing = {c["symbol"] for c in candidates}
-            for s in data:
-                symbol = s.get("symbol", "")
-                price  = float(s.get("price", 0) or 0)
-                change = float(s.get("changesPercentage", 0) or 0)
-                if (symbol and symbol not in existing
-                        and len(symbol) <= 5
-                        and MIN_PRIX <= price <= MAX_PRIX
-                        and change >= MIN_GAP
-                        and not any(symbol.endswith(x) for x in ["W","U","R"])):
-                    candidates.append({
-                        "symbol": symbol,
-                        "price":  price,
-                        "change": change,
-                        "volume": 0,
-                        "source": "FMP Gainers"
-                    })
-            print(f"  FMP Gainers → {len(candidates)} total")
+            print(f"  FMP Pre-Market → {len(candidates)} gappers après filtres")
+
     except Exception as e:
-        print(f"  ⚠ FMP Gainers: {e}")
+        print(f"  ⚠ FMP Pre-Market exception: {e}")
+
+    # ── Source 2 — FMP Pre-Market Gainer ──────────────────────────────
+    # Endpoint alternatif ciblant spécifiquement les hausses pre-market
+    if len(candidates) < 3:
+        try:
+            url = f"https://financialmodelingprep.com/api/v4/pre-market-gainer?apikey={FMP_KEY}"
+            r   = requests.get(url, timeout=10)
+            print(f"  FMP Pre-Market Gainer → HTTP {r.status_code}")
+
+            data = r.json()
+            if isinstance(data, list):
+                existing = {c["symbol"] for c in candidates}
+                print(f"  FMP Pre-Market Gainer raw → {len(data)} entrées")
+                for s in data:
+                    symbol = s.get("symbol", "")
+                    price  = float(s.get("price", 0) or 0)
+                    change = float(s.get("changesPercentage", 0) or 0)
+                    volume = int(s.get("volume", 0) or 0)
+
+                    if (symbol
+                            and symbol not in existing
+                            and len(symbol) <= 5
+                            and MIN_PRIX <= price <= MAX_PRIX
+                            and change >= MIN_GAP
+                            and volume >= MIN_VOL
+                            and not any(symbol.endswith(x) for x in ["W", "U", "R"])):
+                        candidates.append({
+                            "symbol": symbol,
+                            "price":  price,
+                            "change": change,
+                            "volume": volume,
+                            "source": "FMP Pre-Market Gainer"
+                        })
+                print(f"  FMP Pre-Market Gainer → {len(candidates)} total")
+            else:
+                print(f"  ⚠ FMP Pre-Market Gainer réponse: {str(data)[:200]}")
+
+        except Exception as e:
+            print(f"  ⚠ FMP Pre-Market Gainer exception: {e}")
+
+    # ── Source 3 — FMP Gainers (fallback marché régulier) ─────────────
+    # FIX: on ne filtre PAS par volume ici car FMP Gainers retourne
+    # volume=0 en dehors des heures. Le filtre volume se fait dans
+    # get_yahoo_data() sur les données temps réel Yahoo.
+    if len(candidates) < 3:
+        try:
+            url  = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={FMP_KEY}"
+            r    = requests.get(url, timeout=8)
+            print(f"  FMP Gainers → HTTP {r.status_code}")
+
+            data = r.json()
+            if isinstance(data, list):
+                existing = {c["symbol"] for c in candidates}
+                added = 0
+                for s in data:
+                    symbol = s.get("symbol", "")
+                    price  = float(s.get("price", 0) or 0)
+                    change = float(s.get("changesPercentage", 0) or 0)
+
+                    # NOTE: PAS de filtre volume ici — volume réel
+                    # sera vérifié via Yahoo dans l'étape 2.
+                    if (symbol
+                            and symbol not in existing
+                            and len(symbol) <= 5
+                            and MIN_PRIX <= price <= MAX_PRIX
+                            and change >= MIN_GAP
+                            and not any(symbol.endswith(x) for x in ["W", "U", "R"])):
+                        candidates.append({
+                            "symbol": symbol,
+                            "price":  price,
+                            "change": change,
+                            "volume": 0,       # sera mis à jour par Yahoo
+                            "source": "FMP Gainers (fallback)"
+                        })
+                        added += 1
+                print(f"  FMP Gainers → {added} ajoutés, {len(candidates)} total")
+            else:
+                print(f"  ⚠ FMP Gainers réponse: {str(data)[:200]}")
+
+        except Exception as e:
+            print(f"  ⚠ FMP Gainers exception: {e}")
 
     # Trier par variation décroissante
     candidates.sort(key=lambda x: x["change"], reverse=True)
+    print(f"\n  📋 Candidats retenus ({len(candidates)}):")
+    for c in candidates[:10]:
+        print(f"    {c['symbol']:6s} +{c['change']:.1f}% vol={c['volume']:,} [{c['source']}]")
+
     return candidates[:20]
 
 
@@ -136,10 +213,11 @@ def get_yahoo_data(symbol):
         headers = {"User-Agent": "Mozilla/5.0"}
 
         # Daily pour RVOL et historique
-        url_d  = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=60d"
-        r_d    = requests.get(url_d, headers=headers, timeout=5).json()
-        res_d  = r_d.get("chart", {}).get("result", [])
+        url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=60d"
+        r_d   = requests.get(url_d, headers=headers, timeout=5).json()
+        res_d = r_d.get("chart", {}).get("result", [])
         if not res_d:
+            print(f"  ⚠ Yahoo daily vide pour {symbol}")
             return None
 
         meta_d       = res_d[0].get("meta", {})
@@ -163,10 +241,14 @@ def get_yahoo_data(symbol):
                 pass
 
         # Intraday temps réel + pre-market
-        url_rt = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d&includePrePost=true"
+        url_rt = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?interval=1m&range=1d&includePrePost=true"
+        )
         r_rt   = requests.get(url_rt, headers=headers, timeout=5).json()
         res_rt = r_rt.get("chart", {}).get("result", [])
         if not res_rt:
+            print(f"  ⚠ Yahoo intraday vide pour {symbol}")
             return None
 
         meta_rt    = res_rt[0].get("meta", {})
@@ -199,21 +281,27 @@ def get_yahoo_data(symbol):
 
         rvol = round(volume / avg_vol_10, 2) if avg_vol_10 > 0 else 0.0
 
+        # FIX: filtre volume appliqué ici, sur les vraies données Yahoo
+        # (pas sur le volume=0 du fallback FMP Gainers)
+        if volume < MIN_VOL and avg_vol_10 > 0:
+            print(f"  ✗ {symbol} rejeté — volume Yahoo trop faible ({volume:,} < {MIN_VOL:,})")
+            return None
+
         return {
-            "symbol":        symbol,
-            "price":         current_price,
-            "prev_close":    prev_close,
-            "variation":     variation,
-            "gap":           gap,
-            "volume":        volume,
-            "avg_vol_10":    avg_vol_10,
-            "rvol":          rvol,
-            "float_shares":  float_shares,
-            "float_m":       round(float_shares / 1_000_000, 2) if float_shares else 0,
-            "market_cap":    market_cap,
-            "year_high":     year_high,
-            "year_low":      year_low,
-            "mode":          mode,
+            "symbol":       symbol,
+            "price":        current_price,
+            "prev_close":   prev_close,
+            "variation":    variation,
+            "gap":          gap,
+            "volume":       volume,
+            "avg_vol_10":   avg_vol_10,
+            "rvol":         rvol,
+            "float_shares": float_shares,
+            "float_m":      round(float_shares / 1_000_000, 2) if float_shares else 0,
+            "market_cap":   market_cap,
+            "year_high":    year_high,
+            "year_low":     year_low,
+            "mode":         mode,
         }
     except Exception as e:
         print(f"  ⚠ Yahoo {symbol}: {e}")
@@ -226,14 +314,17 @@ def get_yahoo_data(symbol):
 def get_news(symbol):
     """Récupère les news du jour pour un stock."""
     news_items = []
-    today = datetime.now().strftime("%Y-%m-%d")
+    today     = datetime.now().strftime("%Y-%m-%d")
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Finnhub news
     if FINNHUB_KEY:
         try:
-            url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={yesterday}&to={today}&token={FINNHUB_KEY}"
-            r   = requests.get(url, timeout=5).json()
+            url = (
+                f"https://finnhub.io/api/v1/company-news"
+                f"?symbol={symbol}&from={yesterday}&to={today}&token={FINNHUB_KEY}"
+            )
+            r = requests.get(url, timeout=5).json()
             if isinstance(r, list):
                 for n in r[:5]:
                     news_items.append({
@@ -247,8 +338,8 @@ def get_news(symbol):
 
     # FMP news
     try:
-        url  = f"https://financialmodelingprep.com/stable/news/stock?symbols={symbol}&limit=5&apikey={FMP_KEY}"
-        r    = requests.get(url, timeout=5).json()
+        url = f"https://financialmodelingprep.com/stable/news/stock?symbols={symbol}&limit=5&apikey={FMP_KEY}"
+        r   = requests.get(url, timeout=5).json()
         if isinstance(r, list):
             for n in r[:3]:
                 title = n.get("title", "")
@@ -274,17 +365,16 @@ def get_insider_trading(symbol):
 
     # FMP Insider Trading
     try:
-        url  = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={symbol}&limit=10&apikey={FMP_KEY}"
-        r    = requests.get(url, timeout=5).json()
+        url = f"https://financialmodelingprep.com/api/v4/insider-trading?symbol={symbol}&limit=10&apikey={FMP_KEY}"
+        r   = requests.get(url, timeout=5).json()
         if isinstance(r, list):
             for t in r[:5]:
                 transaction_type = t.get("transactionType", "")
-                shares  = t.get("securitiesTransacted", 0)
-                price   = t.get("price", 0)
-                name    = t.get("reportingName", "")
-                title   = t.get("typeOfOwner", "")
-                date    = t.get("transactionDate", "")
-
+                shares = t.get("securitiesTransacted", 0)
+                price  = t.get("price", 0)
+                name   = t.get("reportingName", "")
+                title  = t.get("typeOfOwner", "")
+                date   = t.get("transactionDate", "")
                 if transaction_type and shares:
                     insiders.append({
                         "type":   transaction_type,
@@ -298,12 +388,17 @@ def get_insider_trading(symbol):
     except Exception as e:
         print(f"  ⚠ Insider FMP {symbol}: {e}")
 
-    # OpenInsider via scraping simple
+    # OpenInsider
     try:
-        url = f"https://openinsider.com/screener?s={symbol}&o=&pl=&ph=&ll=&lh=&fd=7&fdr=&td=0&tdr=&fdlyl=&fdlyh=&daysago=&xs=1&vl=&vh=&ocl=&och=&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil=&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=10&action=Filter"
+        today = datetime.now().strftime("%Y-%m-%d")
+        url = (
+            f"https://openinsider.com/screener?s={symbol}&o=&pl=&ph=&ll=&lh="
+            f"&fd=7&fdr=&td=0&tdr=&fdlyl=&fdlyh=&daysago=&xs=1&vl=&vh="
+            f"&ocl=&och=&sic1=-1&sicl=100&sich=9999&grp=0&nfl=&nfh=&nil="
+            f"&nih=&nol=&noh=&v2l=&v2h=&oc2l=&oc2h=&sortcol=0&cnt=10&action=Filter"
+        )
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=8)
-        # Parser basique — chercher les achats dans le HTML
         import re
         purchases = re.findall(r'P - Purchase.*?(\d[\d,]+)', r.text)
         if purchases:
@@ -328,8 +423,11 @@ def get_insider_trading(symbol):
 def get_short_interest(symbol):
     """Récupère le short interest pour évaluer le squeeze potential."""
     try:
-        url  = f"https://financialmodelingprep.com/api/v4/short-interest?symbol={symbol}&date={datetime.now().strftime('%Y-%m-%d')}&apikey={FMP_KEY}"
-        r    = requests.get(url, timeout=5).json()
+        url = (
+            f"https://financialmodelingprep.com/api/v4/short-interest"
+            f"?symbol={symbol}&date={datetime.now().strftime('%Y-%m-%d')}&apikey={FMP_KEY}"
+        )
+        r = requests.get(url, timeout=5).json()
         if isinstance(r, list) and r:
             si = r[0]
             return {
@@ -354,7 +452,6 @@ def analyze_with_ai(stock_data, news, insiders, short_interest):
     symbol = stock_data["symbol"]
     print(f"  🤖 Claude analyse {symbol}...")
 
-    # Préparer le contexte
     news_text = "\n".join([f"- {n['title']} ({n['source']})" for n in news]) if news else "Aucune news trouvée"
 
     insider_text = "Aucune transaction récente"
@@ -430,11 +527,8 @@ Réponds UNIQUEMENT avec le JSON, rien d'autre."""
             },
             timeout=30
         )
-
         if r.status_code == 200:
-            content = r.json()["content"][0]["text"]
-            # Nettoyer et parser le JSON
-            content = content.strip()
+            content = r.json()["content"][0]["text"].strip()
             if content.startswith("```"):
                 content = content.split("```")[1]
                 if content.startswith("json"):
@@ -453,17 +547,17 @@ Réponds UNIQUEMENT avec le JSON, rien d'autre."""
 # ─────────────────────────────────────────────
 def format_telegram_message(stock_data, news, insiders, ai_analysis):
     """Formate le message Telegram avec l'analyse complète."""
-    symbol = stock_data["symbol"]
-    price  = stock_data["price"]
-    var    = stock_data["variation"]
-    gap    = stock_data["gap"]
-    rvol   = stock_data["rvol"]
+    symbol  = stock_data["symbol"]
+    price   = stock_data["price"]
+    var     = stock_data["variation"]
+    gap     = stock_data["gap"]
+    rvol    = stock_data["rvol"]
     float_m = stock_data["float_m"]
     tv_link = f"https://www.tradingview.com/chart/?symbol={symbol}"
 
     if ai_analysis:
-        conviction = ai_analysis.get("conviction", 0)
-        setup_type = ai_analysis.get("setup_type", "—")
+        conviction  = ai_analysis.get("conviction", 0)
+        setup_type  = ai_analysis.get("setup_type", "—")
         cat_quality = ai_analysis.get("catalyst_quality", "—")
         cat_summary = ai_analysis.get("catalyst_summary", "—")
         insider_sig = ai_analysis.get("insider_signal", "—")
@@ -477,17 +571,7 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
         reco        = ai_analysis.get("recommendation", "SURVEILLER")
         summary     = ai_analysis.get("summary", "")
 
-        # Emoji conviction
-        if conviction >= 8:
-            conv_emoji = "🔥🔥🔥"
-        elif conviction >= 6:
-            conv_emoji = "✅✅"
-        elif conviction >= 4:
-            conv_emoji = "📊"
-        else:
-            conv_emoji = "⚠️"
-
-        # Emoji recommendation
+        conv_emoji = "🔥🔥🔥" if conviction >= 8 else "✅✅" if conviction >= 6 else "📊" if conviction >= 4 else "⚠️"
         reco_emoji = "🟢" if reco == "ACHETER" else "🟡" if reco == "SURVEILLER" else "🔴"
 
         msg = (
@@ -501,12 +585,9 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
             f"  ⚡ RVOL : <b>{rvol:.1f}x</b>\n"
             f"  🎯 Float : <b>{float_m:.1f}M</b> actions\n\n"
             f"<b>🔬 Setup :</b> {setup_type}\n\n"
+            f"<b>📰 Catalyst :</b> {cat_quality}\n{cat_summary}\n\n"
         )
 
-        # Catalyst
-        msg += f"<b>📰 Catalyst :</b> {cat_quality}\n{cat_summary}\n\n"
-
-        # Insider
         if insiders:
             insider_lines = []
             for ins in insiders[:2]:
@@ -519,28 +600,21 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
         else:
             msg += f"<b>🏛️ Insider :</b> {insider_sig}\n\n"
 
-        # Short squeeze
-        msg += f"<b>📉 Short Squeeze :</b> {squeeze}\n\n"
-
-        # Plan de trade
         msg += (
+            f"<b>📉 Short Squeeze :</b> {squeeze}\n\n"
             f"<b>🎯 Plan de trade :</b>\n"
             f"  Entrée  : <b>${entry}</b>\n"
             f"  Stop    : <b>${stop}</b>\n"
             f"  Target1 : <b>${t1}</b>\n"
             f"  Target2 : <b>${t2}</b>\n"
             f"  R/R     : <b>{rr}</b>\n\n"
+            f"<b>⚠️ Risques :</b> {risks}\n\n"
         )
 
-        # Risques
-        msg += f"<b>⚠️ Risques :</b> {risks}\n\n"
-
-        # Résumé AI
         if summary:
             msg += f"<b>🤖 Analyse AI :</b>\n{summary}\n\n"
 
     else:
-        # Analyse basique sans AI
         msg = (
             f"⚔️ <b>WARRIOR PRE-MARKET</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -550,14 +624,12 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
             f"  ⚡ RVOL : {rvol:.1f}x\n"
             f"  🎯 Float : {float_m:.1f}M\n\n"
         )
-
         if news:
             msg += "<b>📰 News :</b>\n"
             for n in news[:3]:
                 msg += f"  • {n['title'][:70]}\n"
             msg += "\n"
 
-    # News si disponibles (aperçu)
     if news and ai_analysis:
         msg += "<b>📰 Headlines :</b>\n"
         for n in news[:2]:
@@ -574,14 +646,13 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
 # PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
 
-# Message de démarrage
 send_telegram(
     f"⚔️ <b>WARRIOR AI AGENT</b> — Démarrage scan pre-market\n"
     f"⏰ {now_et.strftime('%H:%M')} ET\n"
     f"🔍 Recherche des meilleurs gappers..."
 )
 
-# 1. Scanner les gappers
+# 1. Scanner
 gappers = get_premarket_gappers()
 
 if not gappers:
@@ -604,50 +675,47 @@ for stock in gappers[:TOP_N]:
     symbol = stock["symbol"]
     print(f"\n  ── {symbol} ──")
 
-    # Données Yahoo
     yahoo_data = get_yahoo_data(symbol)
     if not yahoo_data:
         print(f"  ⚠ Pas de données Yahoo pour {symbol}")
         continue
 
-    # Vérifier float
     if yahoo_data["float_m"] > MAX_FLOAT and yahoo_data["float_m"] > 0:
         print(f"  ✗ Float trop élevé ({yahoo_data['float_m']:.1f}M)")
         continue
 
-    print(f"  Prix: ${yahoo_data['price']:.2f} | Gap: +{yahoo_data['gap']:.1f}% | RVOL: {yahoo_data['rvol']:.1f}x | Float: {yahoo_data['float_m']:.1f}M")
+    print(
+        f"  Prix: ${yahoo_data['price']:.2f} | "
+        f"Gap: +{yahoo_data['gap']:.1f}% | "
+        f"RVOL: {yahoo_data['rvol']:.1f}x | "
+        f"Float: {yahoo_data['float_m']:.1f}M | "
+        f"Vol: {yahoo_data['volume']:,}"
+    )
 
-    # News
-    news = get_news(symbol)
-    print(f"  📰 {len(news)} news trouvées")
-
-    # Insider trading
-    insiders = get_insider_trading(symbol)
-    print(f"  🏛️ {len(insiders)} transactions d'initiés")
-
-    # Short interest
+    news          = get_news(symbol)
+    insiders      = get_insider_trading(symbol)
     short_interest = get_short_interest(symbol)
+    print(f"  📰 {len(news)} news | 🏛️ {len(insiders)} insiders")
 
-    # Analyse AI
     ai_analysis = analyze_with_ai(yahoo_data, news, insiders, short_interest)
 
     analyses.append({
-        "stock":       yahoo_data,
-        "news":        news,
-        "insiders":    insiders,
-        "short":       short_interest,
-        "ai":          ai_analysis,
+        "stock":    yahoo_data,
+        "news":     news,
+        "insiders": insiders,
+        "short":    short_interest,
+        "ai":       ai_analysis,
     })
 
     time.sleep(1)
 
-# 3. Trier par conviction AI
+# 3. Trier par conviction
 analyses.sort(
     key=lambda x: x["ai"].get("conviction", 0) if x["ai"] else 0,
     reverse=True
 )
 
-# 4. Envoyer les recommandations Telegram
+# 4. Envoyer
 if not analyses:
     send_telegram(
         f"⚔️ <b>WARRIOR AI</b>\n"
@@ -656,11 +724,10 @@ if not analyses:
         f"⏰ {now_et.strftime('%H:%M')} ET"
     )
 else:
-    # Résumé d'abord
     summary_lines = []
     for a in analyses:
-        s  = a["stock"]
-        ai = a["ai"]
+        s    = a["stock"]
+        ai   = a["ai"]
         conv = ai.get("conviction", 0) if ai else 0
         reco = ai.get("recommendation", "?") if ai else "?"
         emoji = "🔥" if conv >= 8 else "✅" if conv >= 6 else "📊"
@@ -674,13 +741,12 @@ else:
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 {len(analyses)} stocks analysés\n"
         f"⏰ {now_et.strftime('%H:%M')} ET\n\n"
-        + "\n\n".join(summary_lines) +
-        "\n\n🔍 Analyses détaillées en cours..."
+        + "\n\n".join(summary_lines)
+        + "\n\n🔍 Analyses détaillées en cours..."
     )
 
     time.sleep(2)
 
-    # Analyses détaillées
     for a in analyses:
         msg = format_telegram_message(a["stock"], a["news"], a["insiders"], a["ai"])
         send_telegram(msg)
@@ -689,7 +755,7 @@ else:
 print(f"\n  ✅ Warrior AI Agent terminé — {len(analyses)} analyses envoyées")
 print("=" * 60)
 
-# Garder le processus actif pour Railway
+# Keepalive Railway
 import http.server
 import socketserver
 PORT_WEB = int(os.environ.get("PORT", 8080))
