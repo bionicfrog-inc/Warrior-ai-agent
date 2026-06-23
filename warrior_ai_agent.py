@@ -40,7 +40,14 @@ print("=" * 60)
 # ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
-def send_telegram(message, parse_mode="HTML"):
+def escape_html(text):
+    """Échappe les caractères HTML pour Telegram."""
+    if not text:
+        return ""
+    return (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
     if not TG_TOKEN or not TG_CHAT_ID:
         print("  ⚠ Telegram non configuré")
         print(f"  MESSAGE:\n{message}\n")
@@ -667,19 +674,19 @@ def format_telegram_message(stock_data, news, insiders, ai_analysis):
 
     if ai_analysis:
         conviction  = ai_analysis.get("conviction", 0)
-        setup_type  = ai_analysis.get("setup_type", "—")
-        cat_quality = ai_analysis.get("catalyst_quality", "—")
-        cat_summary = ai_analysis.get("catalyst_summary", "—")
-        insider_sig = ai_analysis.get("insider_signal", "—")
-        squeeze     = ai_analysis.get("squeeze_potential", "—")
-        entry       = ai_analysis.get("entry_zone", "—")
-        stop        = ai_analysis.get("stop_loss", "—")
-        t1          = ai_analysis.get("target_1", "—")
-        t2          = ai_analysis.get("target_2", "—")
-        rr          = ai_analysis.get("risk_reward", "—")
-        risks       = ai_analysis.get("risks", "—")
+        setup_type  = escape_html(ai_analysis.get("setup_type", "—"))
+        cat_quality = escape_html(ai_analysis.get("catalyst_quality", "—"))
+        cat_summary = escape_html(ai_analysis.get("catalyst_summary", "—"))
+        insider_sig = escape_html(ai_analysis.get("insider_signal", "—"))
+        squeeze     = escape_html(ai_analysis.get("squeeze_potential", "—"))
+        entry       = escape_html(ai_analysis.get("entry_zone", "—"))
+        stop        = escape_html(ai_analysis.get("stop_loss", "—"))
+        t1          = escape_html(ai_analysis.get("target_1", "—"))
+        t2          = escape_html(ai_analysis.get("target_2", "—"))
+        rr          = escape_html(ai_analysis.get("risk_reward", "—"))
+        risks       = escape_html(ai_analysis.get("risks", "—"))
         reco        = ai_analysis.get("recommendation", "SURVEILLER")
-        summary     = ai_analysis.get("summary", "")
+        summary     = escape_html(ai_analysis.get("summary", ""))
 
         conv_emoji = "🔥🔥🔥" if conviction >= 8 else "✅✅" if conviction >= 6 else "📊" if conviction >= 4 else "⚠️"
         reco_emoji = "🟢" if reco == "ACHETER" else "🟡" if reco == "SURVEILLER" else "🔴"
