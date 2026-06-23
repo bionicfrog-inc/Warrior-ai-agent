@@ -48,6 +48,9 @@ def escape_html(text):
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
+
+
+def send_telegram(message, parse_mode="HTML"):
     if not TG_TOKEN or not TG_CHAT_ID:
         print("  ⚠ Telegram non configuré")
         print(f"  MESSAGE:\n{message}\n")
