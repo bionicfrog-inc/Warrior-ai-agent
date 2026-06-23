@@ -688,3 +688,20 @@ else:
 
 print(f"\n  ✅ Warrior AI Agent terminé — {len(analyses)} analyses envoyées")
 print("=" * 60)
+
+# Garder le processus actif pour Railway
+import http.server
+import socketserver
+PORT_WEB = int(os.environ.get("PORT", 8080))
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Warrior AI Agent - Online")
+    def log_message(self, format, *args):
+        pass
+
+with socketserver.TCPServer(("", PORT_WEB), Handler) as httpd:
+    print(f"  🌐 Serveur actif sur port {PORT_WEB}")
+    httpd.serve_forever()
