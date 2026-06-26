@@ -14,7 +14,7 @@ ET = pytz.timezone("America/New_York")
 
 # Heures de scan pre-market (ET)
 SCAN_TIMES = [
-    "04:00",  # Ouverture pre-market
+    "05:30",  # Ouverture pre-market
     "06:00",  # Milieu pre-market
     "08:00",  # 1h30 avant ouverture — meilleur moment
     "08:30",  # 1h avant ouverture
