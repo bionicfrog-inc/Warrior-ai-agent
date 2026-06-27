@@ -53,7 +53,7 @@ def run_script(script_name):
 # ─────────────────────────────────────────────
 # PRE-MARKET — 8h00, 8h30, 9h00 ET
 # ─────────────────────────────────────────────
-PREMARKET_TIMES = ["08:00", "08:30", "09:00"]
+PREMARKET_TIMES = ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30", "09:00"]
 
 def premarket_scheduler():
     """Thread qui surveille l'heure et lance le scan pre-market."""
