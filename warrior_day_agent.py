@@ -18,10 +18,11 @@ import socketserver
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-FINNHUB_KEY   = os.environ.get("FINNHUB_KEY",   "")
-TG_TOKEN      = os.environ.get("TG_TOKEN",      "")
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID",    "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+FINNHUB_KEY       = os.environ.get("FINNHUB_KEY",       "")
+TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
+TG_CHAT_ID        = os.environ.get("TG_CHAT_ID",        "")
+ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY",     "")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
 
 ET = pytz.timezone("America/New_York")
 
@@ -98,61 +99,59 @@ def send_telegram(message, parse_mode="HTML"):
 def get_intraday_candidates():
     """
     Agrège 3 sources pour trouver les meilleurs setups intraday:
-    1. Yahoo Gainers (momentum du jour)
-    2. Yahoo Most Active (volume exceptionnel)
-    3. Finnhub News (catalyst frais)
+    1. Alpha Vantage TOP_GAINERS_LOSERS — source principale fiable
+    2. Finnhub News — catalyst frais
+    3. Yahoo Gainers — fallback si < 3 candidats
     Retourne une liste unifiée dédupliquée.
     """
     candidates = {}
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-    # ── Source 1 — Yahoo Gainers ───────────────
-    try:
-        url  = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=50")
-        r    = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        for q in quotes:
-            sym    = q.get("symbol", "")
-            price  = float(q.get("regularMarketPrice", 0) or 0)
-            change = float(q.get("regularMarketChangePercent", 0) or 0)
-            volume = int(q.get("regularMarketVolume", 0) or 0)
-            if sym and len(sym) <= 5 and MIN_PRIX <= price <= MAX_PRIX and change >= MIN_CHANGE:
-                candidates[sym] = {"symbol": sym, "price": price, "change": change,
-                                   "volume": volume, "source": "Yahoo Gainers"}
-        log(f"Yahoo Gainers → {len(quotes)} entrées, {len(candidates)} candidats")
-    except Exception as e:
-        log(f"⚠ Yahoo Gainers: {e}")
+    # ── Source 1 — Alpha Vantage TOP_GAINERS_LOSERS ────────────────────
+    if ALPHA_VANTAGE_KEY:
+        try:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=TOP_GAINERS_LOSERS&apikey={ALPHA_VANTAGE_KEY}"
+            )
+            r    = requests.get(url, timeout=10)
+            data = r.json()
+            log(f"Alpha Vantage → HTTP {r.status_code}")
 
-    # ── Source 2 — Yahoo Most Active ──────────
-    try:
-        url  = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                "?formatted=false&lang=en-US&region=US&scrIds=most_actives&count=50")
-        r    = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        added = 0
-        for q in quotes:
-            sym    = q.get("symbol", "")
-            price  = float(q.get("regularMarketPrice", 0) or 0)
-            change = float(q.get("regularMarketChangePercent", 0) or 0)
-            volume = int(q.get("regularMarketVolume", 0) or 0)
-            if (sym and len(sym) <= 5 and MIN_PRIX <= price <= MAX_PRIX
-                    and change >= MIN_CHANGE and sym not in candidates):
-                candidates[sym] = {"symbol": sym, "price": price, "change": change,
-                                   "volume": volume, "source": "Yahoo Most Active"}
-                added += 1
-        log(f"Yahoo Most Active → {added} ajoutés, {len(candidates)} total")
-    except Exception as e:
-        log(f"⚠ Yahoo Most Active: {e}")
+            sources = [
+                ("top_gainers",          data.get("top_gainers", [])),
+                ("most_actively_traded", data.get("most_actively_traded", [])),
+            ]
+            for src_name, items in sources:
+                for s in items:
+                    sym     = s.get("ticker", "")
+                    price   = float(s.get("price", 0) or 0)
+                    chg_pct = s.get("change_percentage", "0%").replace("%", "")
+                    change  = float(chg_pct or 0)
+                    volume  = int(s.get("volume", 0) or 0)
 
-    # ── Source 3 — Finnhub News (catalyst frais) ──
+                    if (sym and len(sym) <= 5
+                            and MIN_PRIX <= price <= MAX_PRIX
+                            and change >= MIN_CHANGE
+                            and not any(sym.endswith(x) for x in ["W", "U", "R"])
+                            and sym not in candidates):
+                        candidates[sym] = {
+                            "symbol": sym, "price": price,
+                            "change": change, "volume": volume,
+                            "source": f"Alpha Vantage ({src_name})"
+                        }
+
+            log(f"Alpha Vantage → {len(candidates)} candidats")
+
+        except Exception as e:
+            log(f"⚠ Alpha Vantage: {e}")
+    else:
+        log("⚠ ALPHA_VANTAGE_KEY manquante")
+
+    # ── Source 2 — Finnhub News (catalyst frais) ───────────────────────
     if FINNHUB_KEY:
         try:
-            url    = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
-            r_news = requests.get(url, timeout=8).json()
-            import re
+            url_news = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
+            r_news   = requests.get(url_news, timeout=8).json()
             syms_from_news = set()
             if isinstance(r_news, list):
                 for article in r_news[:30]:
@@ -176,8 +175,11 @@ def get_intraday_candidates():
                     volume = int(meta.get("regularMarketVolume", 0) or 0)
                     change = round((price - prev) / prev * 100, 2) if prev else 0
                     if MIN_PRIX <= price <= MAX_PRIX and change >= MIN_CHANGE:
-                        candidates[sym] = {"symbol": sym, "price": price, "change": change,
-                                           "volume": volume, "source": "Finnhub News"}
+                        candidates[sym] = {
+                            "symbol": sym, "price": price,
+                            "change": change, "volume": volume,
+                            "source": "Finnhub News"
+                        }
                         added += 1
                 except Exception:
                     pass
@@ -186,9 +188,34 @@ def get_intraday_candidates():
         except Exception as e:
             log(f"⚠ Finnhub News: {e}")
 
+    # ── Source 3 — Yahoo Gainers (fallback) ───────────────────────────
+    if len(candidates) < 3:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+            url  = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+                    "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=50")
+            r    = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
+                added = 0
+                for q in quotes:
+                    sym    = q.get("symbol", "")
+                    price  = float(q.get("regularMarketPrice", 0) or 0)
+                    change = float(q.get("regularMarketChangePercent", 0) or 0)
+                    volume = int(q.get("regularMarketVolume", 0) or 0)
+                    if (sym and len(sym) <= 5 and MIN_PRIX <= price <= MAX_PRIX
+                            and change >= MIN_CHANGE and sym not in candidates):
+                        candidates[sym] = {"symbol": sym, "price": price,
+                                           "change": change, "volume": volume,
+                                           "source": "Yahoo Gainers"}
+                        added += 1
+                log(f"Yahoo fallback → {added} ajoutés")
+        except Exception as e:
+            log(f"⚠ Yahoo fallback: {e}")
+
     # Trier par variation décroissante
     result = sorted(candidates.values(), key=lambda x: x["change"], reverse=True)
-    log(f"📋 {len(result)} candidats totaux avant filtres Yahoo")
+    log(f"📋 {len(result)} candidats totaux")
     return result[:30]
 
 
