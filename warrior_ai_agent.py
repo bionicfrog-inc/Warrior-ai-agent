@@ -14,11 +14,12 @@ import pytz
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-FMP_KEY       = os.environ.get("FMP_KEY",       "U87EgtNaQOdshmSkc0IgEtCFcgqTDjvy")
-FINNHUB_KEY   = os.environ.get("FINNHUB_KEY",   "d8cf7k9r01qidic7msv0d8cf7k9r01qidic7msvg")
-TG_TOKEN      = os.environ.get("TG_TOKEN",      "")
-TG_CHAT_ID    = os.environ.get("TG_CHAT_ID",    "")
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+FMP_KEY           = os.environ.get("FMP_KEY",           "U87EgtNaQOdshmSkc0IgEtCFcgqTDjvy")
+FINNHUB_KEY       = os.environ.get("FINNHUB_KEY",       "d8cf7k9r01qidic7msv0d8cf7k9r01qidic7msvg")
+TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
+TG_CHAT_ID        = os.environ.get("TG_CHAT_ID",        "")
+ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY",     "")
+ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
 
 ET = pytz.timezone("America/New_York")
 now_et = datetime.now(ET)
@@ -78,91 +79,74 @@ def send_telegram(message, parse_mode="HTML"):
 def get_premarket_gappers():
     """
     Trouve les meilleurs gappers pre-market.
-    Sources (toutes gratuites, sans FMP) :
-      1. Yahoo Finance screener — gainers pre-market
-      2. Finnhub — top symbols avec variation élevée
-      3. Yahoo Finance screener — most active (fallback)
+    Sources par priorité:
+      1. Alpha Vantage TOP_GAINERS_LOSERS — vraie API, données fiables
+      2. Finnhub News — symbols mentionnés dans les news du jour
+      3. Yahoo Finance screener — fallback si < 3 candidats
     """
     print("\n  📡 Scan pre-market en cours...")
-    candidates = []
+    candidates = {}  # dict pour dédupliquer par symbol
 
-    # ── Source 1 — Yahoo Finance Screener (gainers) ────────────────────
-    # Pas de clé API requise. Retourne les plus grands gagnants du jour
-    # incluant la session pre-market quand appelé avant 9h30 ET.
-    try:
-        url = (
-            "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-            "?formatted=false&lang=en-US&region=US&scrIds=day_gainers"
-            "&count=50&start=0"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        print(f"  Yahoo Screener Gainers → HTTP {r.status_code}")
-
-        data = r.json()
-        quotes = (
-            data.get("finance", {})
-                .get("result", [{}])[0]
-                .get("quotes", [])
-        )
-        print(f"  Yahoo Screener raw → {len(quotes)} entrées")
-
-        for q in quotes:
-            symbol = q.get("symbol", "")
-            price  = float(q.get("regularMarketPrice", 0) or 0)
-            change = float(q.get("regularMarketChangePercent", 0) or 0)
-            volume = int(q.get("regularMarketVolume", 0) or 0)
-            # Pre-market price si dispo
-            pre_px = float(q.get("preMarketPrice", 0) or 0)
-            pre_ch = float(q.get("preMarketChangePercent", 0) or 0)
-            if pre_px and pre_ch:
-                price  = pre_px
-                change = pre_ch
-
-            passed = (
-                symbol
-                and len(symbol) <= 5
-                and MIN_PRIX <= price <= MAX_PRIX
-                and change >= MIN_GAP
-                and not any(symbol.endswith(x) for x in ["W", "U", "R"])
+    # ── Source 1 — Alpha Vantage TOP_GAINERS_LOSERS ────────────────────
+    # Endpoint dédié aux gainers/losers/most active — le meilleur pour
+    # trouver les vrais movers pre-market. 25 req/jour gratuit.
+    if ALPHA_VANTAGE_KEY:
+        try:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=TOP_GAINERS_LOSERS&apikey={ALPHA_VANTAGE_KEY}"
             )
-            if passed:
-                candidates.append({
-                    "symbol": symbol,
-                    "price":  price,
-                    "change": change,
-                    "volume": volume,
-                    "source": "Yahoo Gainers"
-                })
-            else:
-                print(f"    ✗ {symbol or '?'} — price={price:.2f} chg={change:.1f}%")
+            r = requests.get(url, timeout=10)
+            print(f"  Alpha Vantage → HTTP {r.status_code}")
 
-        print(f"  Yahoo Gainers → {len(candidates)} gappers après filtres")
+            data = r.json()
 
-    except Exception as e:
-        print(f"  ⚠ Yahoo Screener Gainers exception: {e}")
+            # Combiner gainers + most_actively_traded
+            sources = [
+                ("top_gainers",          data.get("top_gainers", [])),
+                ("most_actively_traded", data.get("most_actively_traded", [])),
+            ]
 
-    # ── Source 2 — Finnhub Stock Screener ─────────────────────────────
-    # Utilise la clé Finnhub existante pour compléter si < 3 candidats
+            for src_name, items in sources:
+                for s in items:
+                    symbol  = s.get("ticker", "")
+                    price   = float(s.get("price", 0) or 0)
+                    chg_pct = s.get("change_percentage", "0%").replace("%", "")
+                    change  = float(chg_pct or 0)
+                    volume  = int(s.get("volume", 0) or 0)
+
+                    passed = (
+                        symbol
+                        and len(symbol) <= 5
+                        and MIN_PRIX <= price <= MAX_PRIX
+                        and change >= MIN_GAP
+                        and not any(symbol.endswith(x) for x in ["W", "U", "R"])
+                    )
+                    if passed and symbol not in candidates:
+                        candidates[symbol] = {
+                            "symbol": symbol,
+                            "price":  price,
+                            "change": change,
+                            "volume": volume,
+                            "source": f"Alpha Vantage ({src_name})"
+                        }
+                        print(f"    ✓ {symbol:6s} +{change:.1f}% vol={volume:,} [{src_name}]")
+
+            print(f"  Alpha Vantage → {len(candidates)} candidats après filtres")
+
+        except Exception as e:
+            print(f"  ⚠ Alpha Vantage exception: {e}")
+    else:
+        print("  ⚠ ALPHA_VANTAGE_KEY non configurée — source principale indisponible")
+
+    # ── Source 2 — Finnhub News (catalyst frais) ───────────────────────
+    # Extrait les symboles mentionnés dans les news du jour
     if FINNHUB_KEY and len(candidates) < 5:
         try:
-            url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
-            # Finnhub n'a pas de screener direct gratuit — on utilise
-            # les quotes sur une watchlist statique de symboles actifs
-            # connue pour le momentum (approche: indices small cap)
-            # Alternative: on va chercher les news récentes pour détecter
-            # les stocks avec catalysts aujourd'hui
-            today = datetime.now().strftime("%Y-%m-%d")
             url_news = f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_KEY}"
-            r_news = requests.get(url_news, timeout=8).json()
+            r_news   = requests.get(url_news, timeout=8).json()
             print(f"  Finnhub news → {len(r_news) if isinstance(r_news, list) else 0} articles")
 
-            # Extraire les symboles mentionnés dans les news financières
-            import re
-            existing = {c["symbol"] for c in candidates}
             symbols_from_news = set()
             if isinstance(r_news, list):
                 for article in r_news[:30]:
@@ -171,34 +155,33 @@ def get_premarket_gappers():
                         for sym in related.split(","):
                             sym = sym.strip().upper()
                             if (sym and len(sym) <= 5
-                                    and sym not in existing
+                                    and sym not in candidates
                                     and not any(sym.endswith(x) for x in ["W", "U", "R"])):
                                 symbols_from_news.add(sym)
 
             print(f"  Finnhub → {len(symbols_from_news)} symboles extraits des news")
 
-            # Vérifier le prix/variation de ces symboles via Yahoo
             for sym in list(symbols_from_news)[:20]:
                 try:
-                    url_q = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1m&range=1d&includePrePost=true"
-                    rq = requests.get(url_q, headers={"User-Agent": "Mozilla/5.0"}, timeout=4).json()
+                    url_q = (
+                        f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+                        f"?interval=1m&range=1d&includePrePost=true"
+                    )
+                    rq   = requests.get(url_q, headers={"User-Agent": "Mozilla/5.0"}, timeout=4).json()
                     meta = rq.get("chart", {}).get("result", [{}])[0].get("meta", {})
                     price  = float(meta.get("preMarketPrice", 0) or meta.get("regularMarketPrice", 0) or 0)
                     prev   = float(meta.get("chartPreviousClose", 0) or 0)
                     volume = int(meta.get("regularMarketVolume", 0) or 0)
                     change = round((price - prev) / prev * 100, 2) if prev else 0
 
-                    if (MIN_PRIX <= price <= MAX_PRIX
-                            and change >= MIN_GAP
-                            and sym not in existing):
-                        candidates.append({
+                    if MIN_PRIX <= price <= MAX_PRIX and change >= MIN_GAP:
+                        candidates[sym] = {
                             "symbol": sym,
                             "price":  price,
                             "change": change,
                             "volume": volume,
                             "source": "Finnhub News"
-                        })
-                        existing.add(sym)
+                        }
                         print(f"    ✓ {sym} +{change:.1f}% @ ${price:.2f}")
                 except Exception:
                     pass
@@ -209,63 +192,57 @@ def get_premarket_gappers():
         except Exception as e:
             print(f"  ⚠ Finnhub exception: {e}")
 
-    # ── Source 3 — Yahoo Most Active (fallback) ────────────────────────
+    # ── Source 3 — Yahoo Finance Screener (fallback) ───────────────────
     if len(candidates) < 3:
         try:
             url = (
                 "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                "?formatted=false&lang=en-US&region=US&scrIds=most_actives"
-                "&count=50&start=0"
+                "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=50"
             )
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-            r = requests.get(url, headers=headers, timeout=10)
-            print(f"  Yahoo Most Active → HTTP {r.status_code}")
+            r       = requests.get(url, headers=headers, timeout=10)
+            print(f"  Yahoo Gainers fallback → HTTP {r.status_code}")
 
-            data   = r.json()
-            quotes = (
-                data.get("finance", {})
-                    .get("result", [{}])[0]
-                    .get("quotes", [])
-            )
-            existing = {c["symbol"] for c in candidates}
-            added = 0
-            for q in quotes:
-                symbol = q.get("symbol", "")
-                price  = float(q.get("regularMarketPrice", 0) or 0)
-                change = float(q.get("regularMarketChangePercent", 0) or 0)
-                volume = int(q.get("regularMarketVolume", 0) or 0)
-                pre_px = float(q.get("preMarketPrice", 0) or 0)
-                pre_ch = float(q.get("preMarketChangePercent", 0) or 0)
-                if pre_px and pre_ch:
-                    price  = pre_px
-                    change = pre_ch
+            if r.status_code == 200:
+                quotes = (
+                    r.json().get("finance", {})
+                            .get("result", [{}])[0]
+                            .get("quotes", [])
+                )
+                added = 0
+                for q in quotes:
+                    symbol = q.get("symbol", "")
+                    price  = float(q.get("regularMarketPrice", 0) or 0)
+                    change = float(q.get("regularMarketChangePercent", 0) or 0)
+                    volume = int(q.get("regularMarketVolume", 0) or 0)
+                    pre_px = float(q.get("preMarketPrice", 0) or 0)
+                    pre_ch = float(q.get("preMarketChangePercent", 0) or 0)
+                    if pre_px and pre_ch:
+                        price, change = pre_px, pre_ch
 
-                if (symbol
-                        and symbol not in existing
-                        and len(symbol) <= 5
-                        and MIN_PRIX <= price <= MAX_PRIX
-                        and change >= MIN_GAP
-                        and not any(symbol.endswith(x) for x in ["W", "U", "R"])):
-                    candidates.append({
-                        "symbol": symbol,
-                        "price":  price,
-                        "change": change,
-                        "volume": volume,
-                        "source": "Yahoo Most Active"
-                    })
-                    added += 1
-            print(f"  Yahoo Most Active → {added} ajoutés, {len(candidates)} total")
+                    if (symbol and symbol not in candidates
+                            and len(symbol) <= 5
+                            and MIN_PRIX <= price <= MAX_PRIX
+                            and change >= MIN_GAP
+                            and not any(symbol.endswith(x) for x in ["W", "U", "R"])):
+                        candidates[symbol] = {
+                            "symbol": symbol, "price": price,
+                            "change": change, "volume": volume,
+                            "source": "Yahoo Gainers"
+                        }
+                        added += 1
+                print(f"  Yahoo fallback → {added} ajoutés")
 
         except Exception as e:
-            print(f"  ⚠ Yahoo Most Active exception: {e}")
+            print(f"  ⚠ Yahoo fallback exception: {e}")
 
     # Trier par variation décroissante
-    candidates.sort(key=lambda x: x["change"], reverse=True)
-    print(f"\n  📋 Candidats retenus ({len(candidates)}):")
-    for c in candidates[:10]:
+    result = sorted(candidates.values(), key=lambda x: x["change"], reverse=True)
+    print(f"\n  📋 {len(result)} candidats retenus:")
+    for c in result[:10]:
         print(f"    {c['symbol']:6s} +{c['change']:.1f}% vol={c['volume']:,} [{c['source']}]")
 
-    return candidates[:20]
+    return result[:20]
 
 
 # ─────────────────────────────────────────────
