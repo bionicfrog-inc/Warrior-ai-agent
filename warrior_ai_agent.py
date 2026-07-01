@@ -1,6 +1,6 @@
 """
 ⚔️ WARRIOR AI AGENT — Pre-Market Edition
-Scan pre-market → AI analysis → Telegram recommendations
+Scan pre-market → AI analysis → Telegram recommendations + Webhook local
 Ross Cameron methodology
 """
 
@@ -20,6 +20,7 @@ TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
 TG_CHAT_ID        = os.environ.get("TG_CHAT_ID",        "")
 ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY",     "")
 ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
+LOCAL_WEBHOOK_URL = os.environ.get("LOCAL_WEBHOOK_URL", "")
 
 ET = pytz.timezone("America/New_York")
 now_et = datetime.now(ET)
@@ -71,6 +72,50 @@ def send_telegram(message, parse_mode="HTML"):
             print(f"  ⚠ Telegram erreur {r.status_code}: {r.text[:100]}")
     except Exception as e:
         print(f"  ⚠ Telegram: {e}")
+
+
+# ─────────────────────────────────────────────
+# WEBHOOK LOCAL (PC via ngrok)
+# ─────────────────────────────────────────────
+def send_webhook(stock_data, ai_analysis):
+    """Envoie le signal JSON au PC local (warrior_local.py) via ngrok pour exécution."""
+    if not LOCAL_WEBHOOK_URL:
+        print("  ⚠ LOCAL_WEBHOOK_URL non configuré — webhook ignoré")
+        return
+    if not ai_analysis:
+        print("  ⚠ Pas d'analyse AI — webhook ignoré")
+        return
+
+    payload = {
+        "symbol":         stock_data["symbol"],
+        "price":          stock_data["price"],
+        "gap":            stock_data["gap"],
+        "variation":      stock_data["variation"],
+        "rvol":           stock_data["rvol"],
+        "float_m":        stock_data["float_m"],
+        "conviction":     ai_analysis.get("conviction", 0),
+        "recommendation": ai_analysis.get("recommendation", "SURVEILLER"),
+        "setup_type":     ai_analysis.get("setup_type", ""),
+        "entry_zone":     ai_analysis.get("entry_zone", ""),
+        "stop_loss":      ai_analysis.get("stop_loss", ""),
+        "target_1":       ai_analysis.get("target_1", ""),
+        "target_2":       ai_analysis.get("target_2", ""),
+        "risk_reward":    ai_analysis.get("risk_reward", ""),
+        "timestamp":      now_et.isoformat(),
+    }
+
+    try:
+        r = requests.post(
+            f"{LOCAL_WEBHOOK_URL}/signal",
+            json=payload,
+            timeout=8
+        )
+        if r.status_code == 200:
+            print(f"  ✅ Webhook envoyé → {stock_data['symbol']}")
+        else:
+            print(f"  ⚠ Webhook erreur {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        print(f"  ⚠ Webhook exception: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -802,6 +847,9 @@ for stock in gappers[:TOP_N]:
     print(f"  📰 {len(news)} news | 🏛️ {len(insiders)} insiders")
 
     ai_analysis = analyze_with_ai(yahoo_data, news, insiders, short_interest)
+
+    # Envoi du signal au PC local (paper trading / exécution) via ngrok
+    send_webhook(yahoo_data, ai_analysis)
 
     analyses.append({
         "stock":    yahoo_data,
