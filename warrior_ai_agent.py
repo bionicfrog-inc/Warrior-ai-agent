@@ -101,6 +101,13 @@ def get_premarket_gappers():
 
             data = r.json()
 
+            # Vérifier si c'est un message d'erreur/info
+            if 'Information' in data or 'Note' in data:
+                print(f'  ⚠ Alpha Vantage limite: {str(data)[:150]}')
+            else:
+                # Combiner gainers + most_actively_traded
+                pass
+
             # Combiner gainers + most_actively_traded
             sources = [
                 ("top_gainers",          data.get("top_gainers", [])),
@@ -197,7 +204,7 @@ def get_premarket_gappers():
         try:
             url = (
                 "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=50"
+                "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=100"
             )
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
             r       = requests.get(url, headers=headers, timeout=10)
