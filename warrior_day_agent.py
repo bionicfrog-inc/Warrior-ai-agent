@@ -28,7 +28,7 @@ ET = pytz.timezone("America/New_York")
 
 # Critères intraday Ross Cameron
 MIN_PRIX      = 1.00    # Minimum $1 intraday (plus strict qu'en pre-market)
-MAX_PRIX      = 20.0
+MAX_PRIX      = 50.0
 MIN_RVOL      = 5.0     # RVOL 5x+ obligatoire
 MIN_VOL_DAY   = 500_000 # Volume cumulé minimum pour être liquide
 MAX_FLOAT     = 500.0   # Shares outstanding — Claude filtre
@@ -188,14 +188,22 @@ def get_intraday_candidates():
         except Exception as e:
             log(f"⚠ Finnhub News: {e}")
 
-    # ── Source 3 — Yahoo Gainers (fallback) ───────────────────────────
+    # ── Source 3 — Yahoo Screeners (fallback, plusieurs IDs) ─────────
     if len(candidates) < 3:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-            url  = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-                    "?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=50")
-            r    = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
+        screener_ids = ["day_gainers", "small_cap_gainers", "most_actives"]
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        for scr_id in screener_ids:
+            if len(candidates) >= 5:
+                break
+            try:
+                url = (
+                    f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+                    f"?formatted=false&lang=en-US&region=US&scrIds={scr_id}&count=100"
+                )
+                r = requests.get(url, headers=headers, timeout=10)
+                log(f"Yahoo {scr_id} → HTTP {r.status_code}")
+                if r.status_code != 200:
+                    continue
                 quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
                 added = 0
                 for q in quotes:
@@ -204,14 +212,16 @@ def get_intraday_candidates():
                     change = float(q.get("regularMarketChangePercent", 0) or 0)
                     volume = int(q.get("regularMarketVolume", 0) or 0)
                     if (sym and len(sym) <= 5 and MIN_PRIX <= price <= MAX_PRIX
-                            and change >= MIN_CHANGE and sym not in candidates):
+                            and change >= MIN_CHANGE and sym not in candidates
+                            and not any(sym.endswith(x) for x in ["W", "U", "R"])):
                         candidates[sym] = {"symbol": sym, "price": price,
                                            "change": change, "volume": volume,
-                                           "source": "Yahoo Gainers"}
+                                           "source": f"Yahoo {scr_id}"}
                         added += 1
-                log(f"Yahoo fallback → {added} ajoutés")
-        except Exception as e:
-            log(f"⚠ Yahoo fallback: {e}")
+                        log(f"    ✓ {sym} +{change:.1f}% @ ${price:.2f}")
+                log(f"Yahoo {scr_id} → {added} ajoutés, {len(candidates)} total")
+            except Exception as e:
+                log(f"⚠ Yahoo {scr_id}: {e}")
 
     # Trier par variation décroissante
     result = sorted(candidates.values(), key=lambda x: x["change"], reverse=True)
