@@ -23,6 +23,7 @@ TG_TOKEN          = os.environ.get("TG_TOKEN",          "")
 TG_CHAT_ID        = os.environ.get("TG_CHAT_ID",        "")
 ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY",     "")
 ALPHA_VANTAGE_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "")
+LOCAL_WEBHOOK_URL = os.environ.get("LOCAL_WEBHOOK_URL", "")
 
 ET = pytz.timezone("America/New_York")
 
@@ -35,6 +36,7 @@ MAX_FLOAT     = 500.0   # Shares outstanding — Claude filtre
 MIN_CHANGE    = 5.0     # +5% minimum sur la journée
 TOP_N         = 5       # Top 5 analysés par Claude
 SCAN_INTERVAL = 300     # Scan toutes les 5 minutes (300 secondes)
+MIN_CONVICTION_WEBHOOK = 5  # Conviction min pour envoyer le webhook à warrior_local.py
 
 # Mémoire des alertes déjà envoyées (évite les doublons)
 # Format: {symbol: {"setup": "Gap & Go", "sent_at": datetime, "price": 5.20}}
@@ -94,12 +96,120 @@ def send_telegram(message, parse_mode="HTML"):
 
 
 # ─────────────────────────────────────────────
+# WEBHOOK LOCAL (PC via ngrok) — MANQUANT DANS LA VERSION ORIGINALE
+# ─────────────────────────────────────────────
+def send_webhook(stock_data, ai_analysis):
+    """Envoie le signal JSON au PC local (warrior_local.py) via ngrok pour exécution.
+    C'est cette fonction qui manquait — sans elle, le Day Agent ne pouvait
+    qu'alerter sur Telegram mais jamais faire entrer le bot en position."""
+    if not LOCAL_WEBHOOK_URL:
+        log("  ⚠ LOCAL_WEBHOOK_URL non configuré — webhook ignoré")
+        return
+    if not ai_analysis:
+        return
+
+    conviction = ai_analysis.get("conviction", 0)
+    if conviction < MIN_CONVICTION_WEBHOOK:
+        log(f"  ⏭ Conviction {conviction}/10 < {MIN_CONVICTION_WEBHOOK} — webhook non envoyé")
+        return
+
+    payload = {
+        "symbol":         stock_data["symbol"],
+        "price":          stock_data["price"],
+        "gap":            stock_data.get("gap", 0),
+        "variation":      stock_data["variation"],
+        "rvol":           stock_data["rvol"],
+        "float_m":        stock_data["float_m"],
+        "conviction":     conviction,
+        "recommendation": ai_analysis.get("recommendation", "SURVEILLER"),
+        "setup_type":     ai_analysis.get("setup_type", stock_data.get("setup", "")),
+        "entry_zone":     ai_analysis.get("entry_zone", ""),
+        "stop_loss":      ai_analysis.get("stop_loss", ""),
+        "target_1":       ai_analysis.get("target_1", ""),
+        "target_2":       ai_analysis.get("target_2", ""),
+        "risk_reward":    ai_analysis.get("risk_reward", ""),
+        "timestamp":      now_et().isoformat(),
+    }
+
+    try:
+        r = requests.post(f"{LOCAL_WEBHOOK_URL}/signal", json=payload, timeout=8)
+        if r.status_code == 200:
+            log(f"  ✅ Webhook envoyé → {stock_data['symbol']}")
+        else:
+            log(f"  ⚠ Webhook erreur {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        log(f"  ⚠ Webhook exception: {e}")
+
+
+def get_historical_setup_stats():
+    """Récupère les stats de performance par setup depuis warrior_local.py (PC).
+    Échec silencieux si indisponible — ne bloque jamais un scan."""
+    if not LOCAL_WEBHOOK_URL:
+        return ""
+    try:
+        r = requests.get(
+            f"{LOCAL_WEBHOOK_URL}/proposals",
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=6
+        )
+        if r.status_code != 200:
+            return ""
+        stats = r.json().get("setup_stats", {})
+        if not stats:
+            return ""
+        lines = []
+        for setup, s in stats.items():
+            lines.append(
+                f"- {setup}: {s['count']} proposition(s) passées, "
+                f"évolution moyenne {s['avg_pct_change']:+.1f}% (4h-11h ET), "
+                f"{s['positive_rate']:.0f}% ont progressé, "
+                f"{s['entered_count']} ont été achetées"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        log(f"  ⚠ Stats historiques indisponibles: {e}")
+        return ""
+
+
+def get_learned_lessons():
+    """Récupère les leçons apprises (analyse rétrospective) depuis warrior_local.py.
+    Échec silencieux si indisponible."""
+    if not LOCAL_WEBHOOK_URL:
+        return ""
+    try:
+        r = requests.get(
+            f"{LOCAL_WEBHOOK_URL}/lessons",
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=6
+        )
+        if r.status_code != 200:
+            return ""
+        lessons = r.json().get("lessons", [])
+        if not lessons:
+            return ""
+        recent = lessons[-10:]
+        lines = []
+        for l in recent:
+            lines.append(
+                f"- [{l.get('date')}] {l.get('symbol')} ({l.get('setup_type')}, "
+                f"conviction donnée {l.get('conviction')}/10) — "
+                f"justifiée: {l.get('conviction_justified')} — {l.get('lesson', '')}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        log(f"  ⚠ Leçons apprises indisponibles: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────────
 # ÉTAPE 1 — SCANNER INTRADAY (toutes sources)
 # ─────────────────────────────────────────────
 def get_intraday_candidates():
     """
     Agrège 3 sources pour trouver les meilleurs setups intraday:
     1. Alpha Vantage TOP_GAINERS_LOSERS — source principale fiable
+       (désactivée après 10h00 ET pour respecter le quota de 25 req/jour —
+       la fenêtre 4h00-10h00 ET est jugée la plus prioritaire)
     2. Finnhub News — catalyst frais
     3. Yahoo Gainers — fallback si < 3 candidats
     Retourne une liste unifiée dédupliquée.
@@ -107,7 +217,8 @@ def get_intraday_candidates():
     candidates = {}
 
     # ── Source 1 — Alpha Vantage TOP_GAINERS_LOSERS ────────────────────
-    if ALPHA_VANTAGE_KEY:
+    use_alpha_vantage = now_et().hour < 10  # coupé après 10h00 ET
+    if ALPHA_VANTAGE_KEY and use_alpha_vantage:
         try:
             url = (
                 f"https://www.alphavantage.co/query"
@@ -144,8 +255,10 @@ def get_intraday_candidates():
 
         except Exception as e:
             log(f"⚠ Alpha Vantage: {e}")
-    else:
+    elif not ALPHA_VANTAGE_KEY:
         log("⚠ ALPHA_VANTAGE_KEY manquante")
+    else:
+        log("⏭ Alpha Vantage désactivé après 10h00 ET (quota) — Finnhub/Yahoo seulement")
 
     # ── Source 2 — Finnhub News (catalyst frais) ───────────────────────
     if FINNHUB_KEY:
@@ -445,6 +558,24 @@ def analyze_with_ai(stock_data, news):
 
     news_text = "\n".join([f"- {n['title']} ({n['source']})" for n in news]) if news else "Aucune news"
 
+    historical_text = get_historical_setup_stats()
+    historical_block = ""
+    if historical_text:
+        historical_block = f"""
+═══ PERFORMANCE HISTORIQUE RÉELLE PAR SETUP (tes propres propositions passées) ═══
+{historical_text}
+Utilise ces données pour calibrer ta conviction.
+"""
+
+    lessons_text = get_learned_lessons()
+    lessons_block = ""
+    if lessons_text:
+        lessons_block = f"""
+═══ LEÇONS APPRISES (auto-critique rétrospective de tes analyses précédentes) ═══
+{lessons_text}
+Tiens compte de ces leçons dans ton raisonnement actuel si elles sont pertinentes.
+"""
+
     prompt = f"""Tu es un expert en day trading momentum small cap, méthode Ross Cameron (Warrior Trading).
 
 Il est actuellement {now_et().strftime('%H:%M')} ET — marché en cours.
@@ -472,7 +603,7 @@ Détails    : {stock_data['setup_details']}
 Stop Loss  : ${stock_data['stop_loss']:.2f}
 Target 1   : ${stock_data['target1']:.2f} (2:1)
 Target 2   : ${stock_data['target2']:.2f} (3:1)
-
+{historical_block}{lessons_block}
 ═══ MISSION ═══
 Évalue ce setup intraday selon Ross Cameron. Réponds UNIQUEMENT en JSON:
 
@@ -716,7 +847,11 @@ def run_scan():
             log(f"  ⏭ {symbol} — Claude recommande ÉVITER")
             continue
 
-        # Envoyer alerte
+        # Envoyer le signal à warrior_local.py — c'est cet appel qui manquait
+        # dans la version originale du Day Agent.
+        send_webhook(data, ai)
+
+        # Envoyer alerte Telegram
         msg = format_day_message(data, news, ai)
         if send_telegram(msg):
             mark_alerted(symbol, data["setup"], data["price"])
