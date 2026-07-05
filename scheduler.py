@@ -1,7 +1,7 @@
 """
 ⚔️ WARRIOR SCHEDULER UNIFIÉ
 Gère les deux agents dans un seul service Railway:
-  - Pre-Market Agent → 8h00, 8h30, 9h00 ET (lundi–vendredi)
+  - Pre-Market Agent → 4h00 à 9h00 ET, toutes les 30 min (lundi–vendredi)
   - Day Trading Agent → boucle 9h30–16h00 ET (lundi–vendredi)
 """
 
@@ -51,9 +51,15 @@ def run_script(script_name):
 
 
 # ─────────────────────────────────────────────
-# PRE-MARKET — 8h00, 8h30, 9h00 ET
+# PRE-MARKET — 4h00 à 9h00 ET, toutes les 30 min
 # ─────────────────────────────────────────────
-PREMARKET_TIMES = ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30", "09:00"]
+# Étendu depuis 4h00 ET (au lieu de 6h00) pour couvrir toute la fenêtre
+# active de warrior_local.py (is_market_hours() démarre à 4h00 ET).
+PREMARKET_TIMES = [
+    "04:00", "04:30", "05:00", "05:30",
+    "06:00", "06:30", "07:00", "07:30",
+    "08:00", "08:30", "09:00"
+]
 
 def premarket_scheduler():
     """Thread qui surveille l'heure et lance le scan pre-market."""
@@ -146,7 +152,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 log("=" * 55)
 log("  ⚔️  WARRIOR SCHEDULER UNIFIÉ")
 log(f"  {now_et().strftime('%Y-%m-%d %H:%M')} ET")
-log("  Pre-Market : 8h00 / 8h30 / 9h00 ET")
+log("  Pre-Market : 4h00 à 9h00 ET (toutes les 30 min)")
 log("  Day Agent  : 9h30–16h00 ET (toutes les 5 min)")
 log("=" * 55)
 
