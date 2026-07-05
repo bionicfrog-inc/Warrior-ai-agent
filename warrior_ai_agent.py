@@ -86,6 +86,11 @@ def send_webhook(stock_data, ai_analysis):
         print("  ⚠ Pas d'analyse AI — webhook ignoré")
         return
 
+    conviction = ai_analysis.get("conviction", 0)
+    if conviction < 5:
+        print(f"  ⏭ Conviction {conviction}/10 < 5 — webhook non envoyé")
+        return
+
     payload = {
         "symbol":         stock_data["symbol"],
         "price":          stock_data["price"],
@@ -561,6 +566,76 @@ def get_short_interest(symbol):
 # ─────────────────────────────────────────────
 # ÉTAPE 6 — ANALYSE AI (Claude)
 # ─────────────────────────────────────────────
+def get_learned_lessons():
+    """
+    Récupère les leçons apprises (analyse rétrospective) depuis warrior_local.py.
+    Échec silencieux si indisponible — ne bloque jamais un scan.
+    """
+    if not LOCAL_WEBHOOK_URL:
+        return ""
+    try:
+        r = requests.get(
+            f"{LOCAL_WEBHOOK_URL}/lessons",
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=6
+        )
+        if r.status_code != 200:
+            return ""
+        lessons = r.json().get("lessons", [])
+        if not lessons:
+            return ""
+
+        # Les 10 leçons les plus récentes suffisent — évite un prompt trop long
+        recent = lessons[-10:]
+        lines = []
+        for l in recent:
+            lines.append(
+                f"- [{l.get('date')}] {l.get('symbol')} ({l.get('setup_type')}, "
+                f"conviction donnée {l.get('conviction')}/10) — "
+                f"justifiée: {l.get('conviction_justified')} — {l.get('lesson', '')}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"  ⚠ Leçons apprises indisponibles: {e}")
+        return ""
+
+
+def get_historical_setup_stats():
+    """
+    Récupère les stats de performance par setup depuis warrior_local.py (PC).
+    Retourne un texte prêt à insérer dans le prompt, ou une chaîne vide
+    si indisponible (PC éteint, ngrok down, pas encore de données, etc.)
+    — échec silencieux voulu pour ne jamais bloquer un scan.
+    """
+    if not LOCAL_WEBHOOK_URL:
+        return ""
+    try:
+        r = requests.get(
+            f"{LOCAL_WEBHOOK_URL}/proposals",
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=6
+        )
+        if r.status_code != 200:
+            return ""
+        data  = r.json()
+        stats = data.get("setup_stats", {})
+        if not stats:
+            return ""
+
+        lines = []
+        for setup, s in stats.items():
+            lines.append(
+                f"- {setup}: {s['count']} proposition(s) passées, "
+                f"évolution moyenne {s['avg_pct_change']:+.1f}% (4h-11h ET), "
+                f"{s['positive_rate']:.0f}% ont progressé, "
+                f"{s['entered_count']} ont été achetées"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"  ⚠ Stats historiques indisponibles: {e}")
+        return ""
+
+
 def analyze_with_ai(stock_data, news, insiders, short_interest):
     """Claude analyse le stock et génère une recommandation Warrior."""
     if not ANTHROPIC_KEY:
@@ -582,6 +657,28 @@ def analyze_with_ai(stock_data, news, insiders, short_interest):
     si_text = "Non disponible"
     if short_interest:
         si_text = f"{short_interest.get('short_pct_float', 0):.1f}% du float vendu à découvert"
+
+    historical_text = get_historical_setup_stats()
+    historical_block = ""
+    if historical_text:
+        historical_block = f"""
+═══ PERFORMANCE HISTORIQUE RÉELLE PAR SETUP (tes propres propositions passées) ═══
+Ces chiffres viennent du suivi réel de tes analyses précédentes (achetées ou non) :
+{historical_text}
+Utilise ces données pour calibrer ta conviction — si un setup a historiquement bien
+performé pour ce système, c'est un bon signe ; s'il performe mal, sois plus prudent.
+"""
+
+    lessons_text = get_learned_lessons()
+    lessons_block = ""
+    if lessons_text:
+        lessons_block = f"""
+═══ LEÇONS APPRISES (auto-critique rétrospective de tes analyses précédentes) ═══
+Après chaque journée, une analyse rétrospective compare tes prédictions au
+comportement réel des chandelles (4h00-11h00 ET). Voici tes leçons récentes :
+{lessons_text}
+Tiens compte de ces leçons dans ton raisonnement actuel si elles sont pertinentes.
+"""
 
     prompt = f"""Tu es un expert en trading momentum small cap, spécialisé dans la méthode Ross Cameron (Warrior Trading).
 
@@ -606,6 +703,46 @@ Mode       : {stock_data['mode']}
 ═══ SHORT INTEREST ═══
 {si_text}
 
+═══ RÉFÉRENCE — LES 6 SETUPS WARRIOR TRADING ═══
+Utilise ces définitions précises pour identifier le setup_type et calibrer ta conviction.
+Un setup qui coche tous ses critères mérite une conviction plus haute qu'un setup incomplet.
+
+1) GAP & GO
+   - Gap pre-market ≥ 4% avec catalyst identifiable (earnings, FDA, PR, upgrade)
+   - Volume pre-market déjà élevé par rapport à la moyenne (signe d'intérêt réel, pas juste un drift léger)
+   - Se joue typiquement dans les 30 premières minutes après l'ouverture (9h30-10h00 ET)
+   - Entrée classique : cassure du plus haut pre-market ou du plus haut de la 1ère bougie 1 min après 9h30
+   - Un gap sans catalyst clair est plus à risque de se refermer ("gap fill") — pénaliser la conviction
+
+2) ORBO (Opening Range Breakout)
+   - Range défini par le plus haut/bas des 5 à 15 premières minutes après 9h30 ET
+   - Entrée sur cassure confirmée (clôture de bougie au-delà du range, pas juste une mèche) avec volume en expansion
+   - Stop logique = l'autre côté du range (ou le milieu du range pour un stop plus serré)
+   - Un range trop étroit (bruit) ou trop large (mauvais R/R) est à éviter
+
+3) EMA9 PULLBACK (Bone Zone)
+   - Nécessite une tendance déjà établie (plusieurs bougies vertes, volume croissant sur la poussée initiale)
+   - Entrée sur le retour du prix vers l'EMA9 (idéalement zone EMA9-EMA20) avec volume décroissant pendant le pullback
+   - Confirmation : une bougie verte qui tient la zone et fait un nouveau plus haut relance l'entrée
+   - Stop juste sous l'EMA9/EMA20 ou sous le bas de la bougie de pullback
+   - Une clôture nette sous l'EMA9 invalide le setup (perte de momentum)
+
+4) HOD BREAKOUT (High of Day)
+   - Le prix casse le plus haut de la séance en cours avec volume en expansion (confirmation obligatoire)
+   - Plus la cassure est propre (peu de mèches, clôture proche du haut), plus le signal est fiable
+   - Risque principal : cassure sur volume faible = piège haussier (fakeout) probable
+
+5) FLAT TOP BREAKOUT
+   - Le prix monte, recule légèrement, puis teste plusieurs fois un même niveau de résistance sans le casser (plafond plat visible sur le graphique)
+   - Ce plafond signale un vendeur important à ce niveau — la cassure survient une fois que ce vendeur est absorbé
+   - Entrée sur la cassure confirmée du plafond avec volume ; stop sous le bas de la dernière bougie avant cassure
+   - Plus le nombre de tests du plafond est élevé sans casser, plus la cassure éventuelle a de chances d'être significative
+
+6) FIRST PULLBACK
+   - Le tout premier repli après le mouvement initial de la journée (souvent juste après l'ouverture)
+   - Se joue dans la même zone EMA9/EMA20 que le "EMA9 Pullback", mais spécifiquement sur le PREMIER repli — considéré comme le setup le plus fiable et le moins risqué de la méthode
+   - Volume doit diminuer pendant le repli, puis reprendre à la reprise haussière
+{historical_block}{lessons_block}
 ═══ TA MISSION ═══
 Analyse ce setup selon la méthode Ross Cameron et réponds en JSON avec EXACTEMENT cette structure :
 
