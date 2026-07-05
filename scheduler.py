@@ -55,10 +55,15 @@ def run_script(script_name):
 # ─────────────────────────────────────────────
 # Étendu depuis 4h00 ET (au lieu de 6h00) pour couvrir toute la fenêtre
 # active de warrior_local.py (is_market_hours() démarre à 4h00 ET).
+# Intervalle de 20 min pour respecter le quota Alpha Vantage (25 req/jour)
+# tout en priorisant la fenêtre 4h00-10h00, jugée la plus pertinente.
 PREMARKET_TIMES = [
-    "04:00", "04:30", "05:00", "05:30",
-    "06:00", "06:30", "07:00", "07:30",
-    "08:00", "08:30", "09:00"
+    "04:00", "04:20", "04:40",
+    "05:00", "05:20", "05:40",
+    "06:00", "06:20", "06:40",
+    "07:00", "07:20", "07:40",
+    "08:00", "08:20", "08:40",
+    "09:00"
 ]
 
 def premarket_scheduler():
@@ -152,7 +157,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 log("=" * 55)
 log("  ⚔️  WARRIOR SCHEDULER UNIFIÉ")
 log(f"  {now_et().strftime('%Y-%m-%d %H:%M')} ET")
-log("  Pre-Market : 4h00 à 9h00 ET (toutes les 30 min)")
+log("  Pre-Market : 4h00 à 9h00 ET (toutes les 20 min)")
 log("  Day Agent  : 9h30–16h00 ET (toutes les 5 min)")
 log("=" * 55)
 
