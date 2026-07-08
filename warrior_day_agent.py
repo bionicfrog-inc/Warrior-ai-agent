@@ -9,11 +9,8 @@ import requests
 import os
 import json
 import time
-import threading
 from datetime import datetime, timedelta
 import pytz
-import http.server
-import socketserver
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -40,8 +37,46 @@ MIN_CONVICTION_WEBHOOK = 5  # Conviction min pour envoyer le webhook à warrior_
 
 # Mémoire des alertes déjà envoyées (évite les doublons)
 # Format: {symbol: {"setup": "Gap & Go", "sent_at": datetime, "price": 5.20}}
-alertes_envoyees: dict = {}
+# Persistée sur disque car le script tourne en one-shot (relancé par
+# scheduler.py toutes les 5 min) — sans ça le cooldown serait perdu
+# à chaque relance.
+ALERTES_FILE = os.environ.get("ALERTES_FILE", "alertes_envoyees.json")
 COOLDOWN_MINUTES = 30  # Même stock → pas d'alerte avant 30 min
+
+def load_alertes() -> dict:
+    if not os.path.exists(ALERTES_FILE):
+        return {}
+    try:
+        with open(ALERTES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {
+            symbol: {
+                "setup":   entry["setup"],
+                "sent_at": datetime.fromisoformat(entry["sent_at"]),
+                "price":   entry["price"],
+            }
+            for symbol, entry in raw.items()
+        }
+    except Exception as e:
+        print(f"⚠ Impossible de charger {ALERTES_FILE}: {e}")
+        return {}
+
+def save_alertes(data: dict):
+    try:
+        serializable = {
+            symbol: {
+                "setup":   entry["setup"],
+                "sent_at": entry["sent_at"].isoformat(),
+                "price":   entry["price"],
+            }
+            for symbol, entry in data.items()
+        }
+        with open(ALERTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+    except Exception as e:
+        print(f"⚠ Impossible de sauvegarder {ALERTES_FILE}: {e}")
+
+alertes_envoyees: dict = load_alertes()
 
 
 # ─────────────────────────────────────────────
@@ -863,50 +898,37 @@ def run_scan():
 
 
 # ─────────────────────────────────────────────
-# SCHEDULER — boucle toutes les 5 minutes
+# MESSAGE DE DÉMARRAGE (une fois par jour, au premier cycle)
 # ─────────────────────────────────────────────
-def scheduler_loop():
-    log("🚀 Warrior Day Agent démarré")
-    log(f"📅 Scan toutes les {SCAN_INTERVAL//60} min | Marché 9h30–16h00 ET")
-
-    # Message de démarrage
-    send_telegram(
-        f"⚔️ <b>WARRIOR DAY AGENT</b> — Démarré\n"
-        f"📅 Scan toutes les {SCAN_INTERVAL//60} min\n"
-        f"⏰ 9h30–16h00 ET\n"
-        f"🔕 Alertes seulement si signal détecté"
-    )
-
-    while True:
-        try:
-            run_scan()
-        except Exception as e:
-            log(f"⚠ Erreur scan: {e}")
-
-        log(f"💤 Prochain scan dans {SCAN_INTERVAL//60} min...")
-        time.sleep(SCAN_INTERVAL)
+def send_startup_message_if_first_run():
+    now = now_et()
+    if now.hour == 9 and now.minute < 35:
+        send_telegram(
+            f"⚔️ <b>WARRIOR DAY AGENT</b> — Démarré\n"
+            f"📅 Scan toutes les {SCAN_INTERVAL//60} min\n"
+            f"⏰ 9h30–16h00 ET\n"
+            f"🔕 Alertes seulement si signal détecté"
+        )
 
 
 # ─────────────────────────────────────────────
-# KEEPALIVE RAILWAY + DÉMARRAGE
+# EXÉCUTION — un seul cycle de scan puis on quitte
 # ─────────────────────────────────────────────
-PORT_WEB = int(os.environ.get("PORT", 8080))
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        status = "OPEN" if is_market_open() else "CLOSED"
-        msg = f"Warrior Day Agent | Market: {status} | Alerts sent: {len(alertes_envoyees)}"
-        self.wfile.write(msg.encode())
-    def log_message(self, format, *args):
-        pass
-
-# Lancer le scheduler dans un thread séparé
-t = threading.Thread(target=scheduler_loop, daemon=True)
-t.start()
-
-# Serveur HTTP keepalive (Railway exige un port ouvert)
-log(f"🌐 Serveur keepalive sur port {PORT_WEB}")
-with socketserver.TCPServer(("", PORT_WEB), Handler) as httpd:
-    httpd.serve_forever()
+# NOTE: ce script est lancé en sous-processus toutes les 5 min par
+# scheduler.py (le vrai scheduler tourne côté Railway, dans scheduler.py,
+# qui gère lui-même son propre serveur keepalive). Ce script ne doit donc
+# PAS boucler ni ouvrir de serveur keepalive lui-même — l'ancienne version
+# le faisait (thread + socketserver.TCPServer en écoute permanente sur le
+# port Railway), ce qui empêchait tout relancement ultérieur de prendre
+# le port ("OSError: Address already in use") et crashait la quasi-totalité
+# des cycles de 5 min toute la journée.
+if __name__ == "__main__":
+    log("🚀 Warrior Day Agent — cycle de scan")
+    send_startup_message_if_first_run()
+    try:
+        run_scan()
+    except Exception as e:
+        log(f"⚠ Erreur scan: {e}")
+    finally:
+        save_alertes(alertes_envoyees)
+    log("✅ Cycle terminé — le prochain sera relancé par scheduler.py dans 5 min")
