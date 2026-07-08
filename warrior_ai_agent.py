@@ -1045,19 +1045,9 @@ else:
 print(f"\n  ✅ Warrior AI Agent terminé — {len(analyses)} analyses envoyées")
 print("=" * 60)
 
-# Keepalive Railway
-import http.server
-import socketserver
-PORT_WEB = int(os.environ.get("PORT", 8080))
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Warrior AI Agent - Online")
-    def log_message(self, format, *args):
-        pass
-
-with socketserver.TCPServer(("", PORT_WEB), Handler) as httpd:
-    print(f"  🌐 Serveur actif sur port {PORT_WEB}")
-    httpd.serve_forever()
+# NOTE: aucun serveur keepalive ici — ce script est lancé en sous-processus
+# par scheduler.py (toutes les 20 min entre 4h00 et 9h00 ET), qui gère lui
+# -même le seul serveur keepalive nécessaire côté Railway. L'ancienne
+# version ouvrait ici aussi un socketserver.TCPServer().serve_forever() sur
+# le même port que scheduler.py, ce qui empêchait le script de jamais
+# se terminer et entrait en conflit de port avec les lancements suivants.
