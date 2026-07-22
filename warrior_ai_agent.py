@@ -585,6 +585,19 @@ def get_learned_lessons():
         if not lessons:
             return ""
 
+        # FIX (22 juillet): ne garder que les leçons issues du pipeline
+        # automatisé réel ("source": "railway"). Les entrées "manuel"
+        # viennent de tests/saisies manuelles avec des convictions 10/10
+        # mal calibrées au départ (ex: AAPL, SNES, BGDE, LILA, ZCMD, MDCX,
+        # INM) — leurs adjustment_suggestion ("plafonner à 3/10", "0/10",
+        # etc.) polluaient le scoring du vrai pipeline et créaient un
+        # effet de cliquet qui compressait toute conviction vers le bas
+        # au fil des jours, sans rapport avec la qualité réelle des
+        # setups Gap & Go automatisés.
+        lessons = [l for l in lessons if l.get("source") == "railway"]
+        if not lessons:
+            return ""
+
         # Les 10 leçons les plus récentes suffisent — évite un prompt trop long
         recent = lessons[-10:]
         lines = []
@@ -637,7 +650,7 @@ def get_historical_setup_stats():
 
 
 def analyze_with_ai(stock_data, news, insiders, short_interest):
-    """Claude analyse le stock et génère une recommandation Warrior."""
+    """Claude analyse le stock et génère une recommandation Warrior — Gap & Go uniquement (pre-market)."""
     if not ANTHROPIC_KEY:
         print("  ⚠ Pas de clé Anthropic — analyse basique")
         return None
@@ -680,7 +693,22 @@ comportement réel des chandelles (4h00-11h00 ET). Voici tes leçons récentes :
 Tiens compte de ces leçons dans ton raisonnement actuel si elles sont pertinentes.
 """
 
+    # FIX (22 juillet) : ce scan tourne exclusivement en pre-market (4h-9h ET),
+    # avant l'ouverture. Sur les 6 setups Warrior, seul le Gap & Go est
+    # observable/vérifiable à ce stade — les 5 autres (ORBO, EMA9 Pullback,
+    # HOD Breakout, Flat Top, First Pullback) exigent une séance déjà en
+    # cours (range d'ouverture, tendance établie, plus haut de la séance,
+    # etc.) qui n'existe pas encore. Présenter ces 6 setups à Claude
+    # l'amenait à conclure systématiquement "setup incomplet" → conviction
+    # compressée vers le bas. Le prompt ne présente donc plus que le
+    # Gap & Go, avec la grille complète de calibration adaptée au pre-market.
     prompt = f"""Tu es un expert en trading momentum small cap, spécialisé dans la méthode Ross Cameron (Warrior Trading).
+
+Ce scan tourne en PRE-MARKET (avant 9h30 ET). À ce stade, le seul setup Warrior
+observable et vérifiable est le GAP & GO — les autres setups (ORBO, EMA9 Pullback,
+HOD Breakout, Flat Top, First Pullback) nécessitent une séance déjà en cours et ne
+peuvent pas être évalués maintenant. N'essaie pas de les identifier ou de les
+pénaliser pour ne pas être remplis : ce n'est pas pertinent à ce stade.
 
 Analyse ce stock pre-market et donne une recommandation de trading claire.
 
@@ -703,48 +731,21 @@ Mode       : {stock_data['mode']}
 ═══ SHORT INTEREST ═══
 {si_text}
 
-═══ RÉFÉRENCE — LES 6 SETUPS WARRIOR TRADING ═══
-Utilise ces définitions précises pour identifier le setup_type et calibrer ta conviction.
-Un setup qui coche tous ses critères mérite une conviction plus haute qu'un setup incomplet.
+═══ RÉFÉRENCE — LE SETUP GAP & GO (le seul jouable en pre-market) ═══
+- Gap pre-market ≥ 4% avec catalyst identifiable (earnings, FDA, PR, upgrade)
+- Volume pre-market déjà élevé par rapport à la moyenne (signe d'intérêt réel, pas juste un drift léger)
+- Se joue typiquement dans les 30 premières minutes après l'ouverture (9h30-10h00 ET)
+- Entrée classique : cassure du plus haut pre-market ou du plus haut de la 1ère bougie 1 min après 9h30
+- Un gap sans catalyst clair est plus à risque de se refermer ("gap fill") — pénaliser la conviction en conséquence, mais un gap avec catalyst solide et volume réel mérite une conviction franche (7-9), pas systématiquement plafonnée
 
-1) GAP & GO
-   - Gap pre-market ≥ 4% avec catalyst identifiable (earnings, FDA, PR, upgrade)
-   - Volume pre-market déjà élevé par rapport à la moyenne (signe d'intérêt réel, pas juste un drift léger)
-   - Se joue typiquement dans les 30 premières minutes après l'ouverture (9h30-10h00 ET)
-   - Entrée classique : cassure du plus haut pre-market ou du plus haut de la 1ère bougie 1 min après 9h30
-   - Un gap sans catalyst clair est plus à risque de se refermer ("gap fill") — pénaliser la conviction
-
-2) ORBO (Opening Range Breakout)
-   - Range défini par le plus haut/bas des 5 à 15 premières minutes après 9h30 ET
-   - Entrée sur cassure confirmée (clôture de bougie au-delà du range, pas juste une mèche) avec volume en expansion
-   - Stop logique = l'autre côté du range (ou le milieu du range pour un stop plus serré)
-   - Un range trop étroit (bruit) ou trop large (mauvais R/R) est à éviter
-
-3) EMA9 PULLBACK (Bone Zone)
-   - Nécessite une tendance déjà établie (plusieurs bougies vertes, volume croissant sur la poussée initiale)
-   - Entrée sur le retour du prix vers l'EMA9 (idéalement zone EMA9-EMA20) avec volume décroissant pendant le pullback
-   - Confirmation : une bougie verte qui tient la zone et fait un nouveau plus haut relance l'entrée
-   - Stop juste sous l'EMA9/EMA20 ou sous le bas de la bougie de pullback
-   - Une clôture nette sous l'EMA9 invalide le setup (perte de momentum)
-
-4) HOD BREAKOUT (High of Day)
-   - Le prix casse le plus haut de la séance en cours avec volume en expansion (confirmation obligatoire)
-   - Plus la cassure est propre (peu de mèches, clôture proche du haut), plus le signal est fiable
-   - Risque principal : cassure sur volume faible = piège haussier (fakeout) probable
-
-5) FLAT TOP BREAKOUT
-   - Le prix monte, recule légèrement, puis teste plusieurs fois un même niveau de résistance sans le casser (plafond plat visible sur le graphique)
-   - Ce plafond signale un vendeur important à ce niveau — la cassure survient une fois que ce vendeur est absorbé
-   - Entrée sur la cassure confirmée du plafond avec volume ; stop sous le bas de la dernière bougie avant cassure
-   - Plus le nombre de tests du plafond est élevé sans casser, plus la cassure éventuelle a de chances d'être significative
-
-6) FIRST PULLBACK
-   - Le tout premier repli après le mouvement initial de la journée (souvent juste après l'ouverture)
-   - Se joue dans la même zone EMA9/EMA20 que le "EMA9 Pullback", mais spécifiquement sur le PREMIER repli — considéré comme le setup le plus fiable et le moins risqué de la méthode
-   - Volume doit diminuer pendant le repli, puis reprendre à la reprise haussière
+═══ GRILLE DE CALIBRATION (utilise-la comme référence, pas comme plafond automatique) ═══
+- 8-10 : gap ≥8%, catalyst news dur et récent (FDA, earnings, PR majeur), volume pre-market réel et soutenu, float compatible avec un squeeze
+- 6-7  : gap solide avec catalyst identifiable mais moins spectaculaire, ou volume correct sans catalyst hard news
+- 4-5  : gap présent mais catalyst faible/absent ou volume pre-market incertain — surveiller, pas encore une conviction d'entrée
+- 1-3  : gap sans catalyst ni volume réel, probable gap fill ou faux signal
 {historical_block}{lessons_block}
 ═══ TA MISSION ═══
-Analyse ce setup selon la méthode Ross Cameron et réponds en JSON avec EXACTEMENT cette structure :
+Analyse ce setup Gap & Go selon la méthode Ross Cameron et réponds en JSON avec EXACTEMENT cette structure :
 
 {{
   "conviction": 8,
@@ -763,7 +764,7 @@ Analyse ce setup selon la méthode Ross Cameron et réponds en JSON avec EXACTEM
   "summary": "Setup Gap & Go classique Ross Cameron avec catalyst FDA fort. Float de 3.2M = explosive. Entrée sur consolidation au-dessus de $2.50."
 }}
 
-conviction = 1-10 (10 = meilleur setup possible)
+conviction = 1-10 (10 = meilleur setup possible), utilise toute l'échelle — ne réserve pas les scores élevés à des cas exceptionnels quand la grille de calibration ci-dessus les justifie
 recommendation = ACHETER, SURVEILLER, ou ÉVITER
 Réponds UNIQUEMENT avec le JSON, rien d'autre."""
 
