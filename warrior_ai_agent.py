@@ -595,6 +595,17 @@ def get_learned_lessons():
         # au fil des jours, sans rapport avec la qualité réelle des
         # setups Gap & Go automatisés.
         lessons = [l for l in lessons if l.get("source") == "railway"]
+        # FIX (22 juillet, suite): écarter aussi les leçons construites sur le
+        # fallback Yahoo ("candle_source": "yahoo_fallback") côté warrior_local.py
+        # — Yahoo peut afficher V:0 par artefact sur le pre-market des small
+        # caps, ce qui a généré plusieurs diagnostics "marché mort" erronés
+        # (BGDE, MDCX, ATPC...). Ne garder que les leçons basées sur des
+        # chandelles OpenD/Moomoo (LV3), fiables sur le volume réel.
+        # Les leçons antérieures à ce correctif n'ont pas de champ
+        # "candle_source" (absent = None) — traitées comme non fiables,
+        # donc exclues par défaut jusqu'à accumulation de nouvelles leçons
+        # basées sur OpenD.
+        lessons = [l for l in lessons if l.get("candle_source") == "opend"]
         if not lessons:
             return ""
 
