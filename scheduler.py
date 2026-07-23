@@ -1,7 +1,7 @@
 """
 ⚔️ WARRIOR SCHEDULER UNIFIÉ
 Gère les deux agents dans un seul service Railway:
-  - Pre-Market Agent → 4h00 à 9h00 ET, toutes les 30 min (lundi–vendredi)
+  - Pre-Market Agent → 4h00 à 9h29 ET, toutes les ~20 min puis resserré en fin de fenêtre (lundi–vendredi)
   - Day Trading Agent → boucle 9h30–16h00 ET (lundi–vendredi)
 """
 
@@ -51,19 +51,28 @@ def run_script(script_name):
 
 
 # ─────────────────────────────────────────────
-# PRE-MARKET — 4h00 à 9h00 ET, toutes les 30 min
+# PRE-MARKET — 4h00 à 9h29 ET
 # ─────────────────────────────────────────────
 # Étendu depuis 4h00 ET (au lieu de 6h00) pour couvrir toute la fenêtre
 # active de warrior_local.py (is_market_hours() démarre à 4h00 ET).
 # Intervalle de 20 min pour respecter le quota Alpha Vantage (25 req/jour)
 # tout en priorisant la fenêtre 4h00-10h00, jugée la plus pertinente.
+#
+# FIX (22 juillet 2026) : il existait un trou 9h00-9h30 ET où ni ce scan
+# pre-market (qui s'arrêtait à 9h00) ni le day agent (qui démarre à 9h30)
+# ne tournaient. Cette demi-heure correspond justement à la diffusion des
+# données d'imbalance d'ouverture (NYSE/Nasdaq) — une fenêtre où le prix
+# peut bouger significativement avant l'open, et où une conviction figée
+# à 9h00 devenait obsolète 30 min plus tard. Ajout de scans à 09:10 et
+# 09:20 pour garder une conviction fraîche jusqu'au relais du day agent
+# à 09:30.
 PREMARKET_TIMES = [
     "04:00", "04:20", "04:40",
     "05:00", "05:20", "05:40",
     "06:00", "06:20", "06:40",
     "07:00", "07:20", "07:40",
     "08:00", "08:20", "08:40",
-    "09:00"
+    "09:00", "09:10", "09:20"
 ]
 
 def premarket_scheduler():
@@ -157,7 +166,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 log("=" * 55)
 log("  ⚔️  WARRIOR SCHEDULER UNIFIÉ")
 log(f"  {now_et().strftime('%Y-%m-%d %H:%M')} ET")
-log("  Pre-Market : 4h00 à 9h00 ET (toutes les 20 min)")
+log("  Pre-Market : 4h00 à 9h29 ET (toutes les ~20 min, resserré à 09:10/09:20)")
 log("  Day Agent  : 9h30–16h00 ET (toutes les 5 min)")
 log("=" * 55)
 
