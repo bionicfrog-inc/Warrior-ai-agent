@@ -27,8 +27,8 @@ ET = pytz.timezone("America/New_York")
 # Critères intraday Ross Cameron
 MIN_PRIX      = 1.00    # Minimum $1 intraday (plus strict qu'en pre-market)
 MAX_PRIX      = 50.0
-MIN_RVOL      = 5.0     # RVOL 5x+ obligatoire
-MIN_VOL_DAY   = 500_000 # Volume cumulé minimum pour être liquide
+MIN_VOL_DAY   = 500_000 # Volume cumulé minimum pour être liquide — garde-fou
+                         # opérationnel (liquidité), pas un jugement de stratégie
 MAX_FLOAT     = 500.0   # Shares outstanding — Claude filtre
 MIN_CHANGE    = 5.0     # +5% minimum sur la journée
 TOP_N         = 5       # Top 5 analysés par Claude
@@ -77,6 +77,40 @@ def save_alertes(data: dict):
         print(f"⚠ Impossible de sauvegarder {ALERTES_FILE}: {e}")
 
 alertes_envoyees: dict = load_alertes()
+
+
+# ─────────────────────────────────────────────
+# SYMBOLES DÉJÀ QUALIFIÉS AUJOURD'HUI (30 juillet 2026)
+# ─────────────────────────────────────────────
+# Même correctif que warrior_ai_agent.py : une fois qu'un symbole a atteint
+# conviction ≥5/10 lors d'un cycle précédent, il reste en watchlist locale
+# (warrior_local.py) jusqu'à l'entrée ou la purge — pas besoin de refaire
+# tout le travail de recherche (news + appel Claude complet) à chaque
+# nouveau cycle de 5 minutes. L'effort se concentre sur les candidats pas
+# encore vus aujourd'hui.
+QUALIFIED_FILE = os.environ.get("QUALIFIED_FILE_DAY", "qualified_intraday_today.json")
+
+def load_qualified_today() -> dict:
+    if not os.path.exists(QUALIFIED_FILE):
+        return {}
+    try:
+        with open(QUALIFIED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") != now_et().strftime("%Y-%m-%d"):
+            return {}  # nouvelle journée — on repart à zéro
+        return data.get("symbols", {})
+    except Exception as e:
+        print(f"⚠ Impossible de charger {QUALIFIED_FILE}: {e}")
+        return {}
+
+def save_qualified_today(symbols: dict):
+    try:
+        with open(QUALIFIED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": now_et().strftime("%Y-%m-%d"), "symbols": symbols}, f, indent=2)
+    except Exception as e:
+        print(f"⚠ Impossible de sauvegarder {QUALIFIED_FILE}: {e}")
+
+qualified_today: dict = load_qualified_today()
 
 
 # ─────────────────────────────────────────────
@@ -131,12 +165,10 @@ def send_telegram(message, parse_mode="HTML"):
 
 
 # ─────────────────────────────────────────────
-# WEBHOOK LOCAL (PC via ngrok) — MANQUANT DANS LA VERSION ORIGINALE
+# WEBHOOK LOCAL (PC via ngrok)
 # ─────────────────────────────────────────────
 def send_webhook(stock_data, ai_analysis):
-    """Envoie le signal JSON au PC local (warrior_local.py) via ngrok pour exécution.
-    C'est cette fonction qui manquait — sans elle, le Day Agent ne pouvait
-    qu'alerter sur Telegram mais jamais faire entrer le bot en position."""
+    """Envoie le signal JSON au PC local (warrior_local.py) via ngrok pour exécution."""
     if not LOCAL_WEBHOOK_URL:
         log("  ⚠ LOCAL_WEBHOOK_URL non configuré — webhook ignoré")
         return
@@ -157,7 +189,7 @@ def send_webhook(stock_data, ai_analysis):
         "float_m":        stock_data["float_m"],
         "conviction":     conviction,
         "recommendation": ai_analysis.get("recommendation", "SURVEILLER"),
-        "setup_type":     ai_analysis.get("setup_type", stock_data.get("setup", "")),
+        "setup_type":     ai_analysis.get("setup_type", "Aucun"),
         "entry_zone":     ai_analysis.get("entry_zone", ""),
         "stop_loss":      ai_analysis.get("stop_loss", ""),
         "target_1":       ai_analysis.get("target_1", ""),
@@ -196,7 +228,7 @@ def get_historical_setup_stats():
         for setup, s in stats.items():
             lines.append(
                 f"- {setup}: {s['count']} proposition(s) passées, "
-                f"évolution moyenne {s['avg_pct_change']:+.1f}% (4h-11h ET), "
+                f"évolution moyenne {s['avg_pct_change']:+.1f}% (4h-13h ET), "
                 f"{s['positive_rate']:.0f}% ont progressé, "
                 f"{s['entered_count']} ont été achetées"
             )
@@ -208,7 +240,16 @@ def get_historical_setup_stats():
 
 def get_learned_lessons():
     """Récupère les leçons apprises (analyse rétrospective) depuis warrior_local.py.
-    Échec silencieux si indisponible."""
+    Échec silencieux si indisponible.
+
+    FIX (30 juillet 2026) : même filtre que warrior_ai_agent.py — ne garder
+    que les leçons issues du pipeline automatisé réel ("source": "railway")
+    et basées sur des chandelles OpenD fiables ("candle_source": "opend").
+    Les entrées manuelles et le fallback Yahoo (V:0 par artefact sur le
+    pre-market) ont créé un effet de cliquet qui compressait la conviction
+    vers le bas sans rapport avec la qualité réelle des setups — voir
+    warrior_ai_agent.py pour l'historique complet du diagnostic.
+    """
     if not LOCAL_WEBHOOK_URL:
         return ""
     try:
@@ -222,6 +263,12 @@ def get_learned_lessons():
         lessons = r.json().get("lessons", [])
         if not lessons:
             return ""
+
+        lessons = [l for l in lessons if l.get("source") == "railway"]
+        lessons = [l for l in lessons if l.get("candle_source") == "opend"]
+        if not lessons:
+            return ""
+
         recent = lessons[-10:]
         lines = []
         for l in recent:
@@ -383,10 +430,21 @@ def get_intraday_candidates():
 def get_intraday_data(symbol):
     """
     Récupère les données intraday complètes pour un symbole:
-    - Prix, volume, RVOL, VWAP approximé
-    - HOD (High of Day)
-    - Float via Finnhub
-    - Setup détecté (Gap & Go, ORBO, First Pullback, HOD Break, Flat Top)
+    prix, volume, RVOL, VWAP approximé, HOD/LOD, float, et les dernières
+    chandelles 1min (pour que Claude classe lui-même le setup).
+
+    (30 juillet 2026) HARMONISATION avec warrior_local.py / warrior_ai_agent.py :
+    l'ancienne version détectait elle-même le setup via 5 blocs de seuils
+    numériques codés en dur (gap>=10%, near_vwap<1.5%, flat_tolerance 0.5%,
+    RVOL>=5, etc.) et abandonnait silencieusement (return None) si aucun
+    seuil n'était atteint — Claude n'était alors JAMAIS appelé, exactement
+    le même piège que celui corrigé dans enter_trade() (voir NUWE/ADVB :
+    des setups valides rejetés par des règles trop strictes sans jamais
+    obtenir un second avis). Cette détection rigide est retirée : seuls
+    des garde-fous opérationnels (prix, liquidité minimale) filtrent avant
+    Claude — la classification du setup et la conviction reviennent
+    entièrement à Claude dans analyze_with_ai(), avec les vraies chandelles
+    comme contexte plutôt que des seuils fixes.
     """
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -407,6 +465,14 @@ def get_intraday_data(symbol):
         volume     = int(meta.get("regularMarketVolume", 0) or 0)
 
         if not price or not prev_close:
+            return None
+
+        # ── Garde-fous opérationnels (déterministes) ──
+        if not (MIN_PRIX <= price <= MAX_PRIX):
+            log(f"  ✗ {symbol} — prix hors range (${price:.2f})")
+            return None
+        if volume < MIN_VOL_DAY:
+            log(f"  ✗ {symbol} — volume insuffisant ({volume:,} < {MIN_VOL_DAY:,})")
             return None
 
         # Variation et gap
@@ -431,7 +497,8 @@ def get_intraday_data(symbol):
         else:
             vwap = price
 
-        # Volume moyen journalier (données daily)
+        # Volume moyen journalier (données daily) — pour le RVOL, donné à
+        # Claude comme contexte, plus comme condition de blocage stricte.
         avg_vol_daily = 0
         try:
             url_d  = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=30d"
@@ -459,65 +526,24 @@ def get_intraday_data(symbol):
 
         float_m = round(float_shares / 1_000_000, 1) if float_shares else 0
 
-        # ── DÉTECTION DES SETUPS ROSS CAMERON ─────
-        setup_detected = None
-        setup_details  = ""
-        nb_bars        = len(closes)
+        # Chandelles récentes en texte compact — Claude classe lui-même
+        # le setup (ou "Aucun") à partir de la vraie structure, plutôt
+        # que des seuils fixes.
+        nb_bars = len(closes)
+        candles_text = "Pas assez de données"
+        if nb_bars >= 5 and len(opens) == nb_bars and len(highs) == nb_bars and len(lows) == nb_bars:
+            n_show = min(nb_bars, 20)
+            lines_c = []
+            for i in range(nb_bars - n_show, nb_bars):
+                v_i = volumes[i] if i < len(volumes) else 0
+                lines_c.append(
+                    f"  O:{opens[i]:.2f} H:{highs[i]:.2f} L:{lows[i]:.2f} "
+                    f"C:{closes[i]:.2f} V:{int(v_i)}"
+                )
+            candles_text = "\n".join(lines_c)
 
-        above_vwap  = price > vwap
-        above_open  = price > open_px
-        bull_candle = closes[-1] > opens[-1] if closes and opens else False
-        rvol_ok     = rvol >= MIN_RVOL
-
-        # 1. GAP & GO — gap fort + momentum continu + above VWAP
-        if gap >= 10 and above_vwap and rvol_ok and bull_candle and variation >= 15:
-            setup_detected = "Gap & Go"
-            setup_details  = f"Gap {gap:+.1f}% | Prix au-dessus VWAP | Momentum continu"
-
-        # 2. HOD BREAKOUT — cassure du plus haut du jour avec volume
-        elif price >= hod * 0.998 and price > hod * 0.99 and rvol_ok and bull_candle and nb_bars > 10:
-            setup_detected = "HOD Breakout"
-            setup_details  = f"Cassure HOD ${hod:.2f} | RVOL {rvol:.1f}x"
-
-        # 3. ORBO — cassure de l'Opening Range (5 premières minutes)
-        elif nb_bars > 5:
-            or_high = max(highs[:5]) if len(highs) >= 5 else hod
-            if price > or_high and rvol_ok and bull_candle and above_vwap:
-                setup_detected = "ORBO"
-                setup_details  = f"Cassure Opening Range ${or_high:.2f} | VWAP supporté"
-
-        # 4. FIRST PULLBACK — 1er recul vers VWAP après move fort
-        if not setup_detected and variation >= 10 and nb_bars > 10:
-            recent_high = max(highs[-10:]) if len(highs) >= 10 else hod
-            near_vwap   = abs(price - vwap) / vwap < 0.015  # dans 1.5% du VWAP
-            if near_vwap and bull_candle and rvol_ok and price > open_px:
-                setup_detected = "First Pullback"
-                setup_details  = f"1er recul VWAP ${vwap:.2f} après +{variation:.1f}%"
-
-        # 5. FLAT TOP BREAKOUT — consolidation puis cassure
-        if not setup_detected and len(highs) >= 6:
-            last_highs = highs[-6:-1]
-            if last_highs:
-                avg_recent_high = sum(last_highs) / len(last_highs)
-                flat_tolerance  = avg_recent_high * 0.005  # 0.5% de tolérance
-                is_flat = all(abs(h - avg_recent_high) < flat_tolerance for h in last_highs)
-                if is_flat and price > avg_recent_high * 1.003 and rvol_ok and bull_candle:
-                    setup_detected = "Flat Top Breakout"
-                    setup_details  = f"Cassure résistance ${avg_recent_high:.2f}"
-
-        if not setup_detected:
-            return None  # Pas de setup → pas d'alerte
-
-        # Filtres finaux de qualité
-        if volume < MIN_VOL_DAY:
-            log(f"  ✗ {symbol} — volume insuffisant ({volume:,} < {MIN_VOL_DAY:,})")
-            return None
-
-        if not rvol_ok:
-            log(f"  ✗ {symbol} — RVOL insuffisant ({rvol:.1f}x < {MIN_RVOL}x)")
-            return None
-
-        # Niveaux de trade (ATR approximé)
+        # Niveaux de trade (ATR approximé) — référence donnée à Claude,
+        # qui peut proposer ses propres niveaux dans sa réponse JSON.
         if len(highs) >= 14 and len(lows) >= 14:
             true_ranges = [max(highs[i] - lows[i],
                                abs(highs[i] - closes[i-1]),
@@ -527,9 +553,9 @@ def get_intraday_data(symbol):
         else:
             atr = price * 0.02
 
-        stop_loss = round(price - atr * 0.5, 2)
-        target1   = round(price + (price - stop_loss) * 2.0, 2)
-        target2   = round(price + (price - stop_loss) * 3.0, 2)
+        stop_loss_ref = round(price - atr * 0.5, 2)
+        target1_ref   = round(price + (price - stop_loss_ref) * 2.0, 2)
+        target2_ref   = round(price + (price - stop_loss_ref) * 3.0, 2)
 
         return {
             "symbol":        symbol,
@@ -544,11 +570,10 @@ def get_intraday_data(symbol):
             "lod":           lod,
             "vwap":          round(vwap, 2),
             "float_m":       float_m,
-            "setup":         setup_detected,
-            "setup_details": setup_details,
-            "stop_loss":     stop_loss,
-            "target1":       target1,
-            "target2":       target2,
+            "candles_text":  candles_text,
+            "stop_loss_ref": stop_loss_ref,
+            "target1_ref":   target1_ref,
+            "target2_ref":   target2_ref,
             "atr":           round(atr, 3),
             "nb_bars":       nb_bars,
         }
@@ -582,9 +607,15 @@ def get_news(symbol):
 
 
 # ─────────────────────────────────────────────
-# ÉTAPE 4 — ANALYSE AI (Claude)
+# ÉTAPE 4 — ANALYSE AI (Claude) — classification + conviction
 # ─────────────────────────────────────────────
 def analyze_with_ai(stock_data, news):
+    """(30 juillet 2026) Remplace l'ancienne logique où Claude n'intervenait
+    qu'après qu'un setup ait déjà été détecté par des règles rigides. Claude
+    reçoit maintenant les vraies chandelles et classe lui-même lequel des
+    6 setups Warrior (s'il y en a un) est en train de se former — les 6 sont
+    tous observables en intraday, contrairement au scan pre-market qui ne
+    peut vérifier que le Gap & Go."""
     if not ANTHROPIC_KEY:
         return None
 
@@ -613,9 +644,9 @@ Tiens compte de ces leçons dans ton raisonnement actuel si elles sont pertinent
 
     prompt = f"""Tu es un expert en day trading momentum small cap, méthode Ross Cameron (Warrior Trading).
 
-Il est actuellement {now_et().strftime('%H:%M')} ET — marché en cours.
-
-Analyse ce setup INTRADAY et donne une recommandation immédiate.
+Il est actuellement {now_et().strftime('%H:%M')} ET — marché en cours (séance déjà entamée,
+donc les 6 setups Warrior sont tous potentiellement observables, contrairement
+à un scan pre-market).
 
 ═══ DONNÉES INTRADAY ═══
 Symbole    : {stock_data['symbol']}
@@ -628,19 +659,32 @@ VWAP       : ${stock_data['vwap']:.2f}
 Volume     : {stock_data['volume']:,}
 RVOL       : {stock_data['rvol']:.1f}x
 Float      : {stock_data['float_m']:.1f}M (shares outstanding)
-Setup      : {stock_data['setup']}
-Détails    : {stock_data['setup_details']}
+
+═══ DERNIÈRES CHANDELLES 1 MINUTE (les plus récentes en dernier) ═══
+{stock_data['candles_text']}
 
 ═══ NEWS ═══
 {news_text}
 
-═══ NIVEAUX CALCULÉS ═══
-Stop Loss  : ${stock_data['stop_loss']:.2f}
-Target 1   : ${stock_data['target1']:.2f} (2:1)
-Target 2   : ${stock_data['target2']:.2f} (3:1)
+═══ NIVEAUX DE RÉFÉRENCE (calcul local ATR — tu peux proposer les tiens) ═══
+Stop Loss  : ${stock_data['stop_loss_ref']:.2f}
+Target 1   : ${stock_data['target1_ref']:.2f} (2:1)
+Target 2   : ${stock_data['target2_ref']:.2f} (3:1)
+
+═══ RÉFÉRENCE — LES 6 SETUPS WARRIOR TRADING ═══
+1) GAP & GO — gap tenu avec catalyst, cassure du plus haut pre-market ou de la 1ère bougie post-9h30
+2) ORBO — cassure confirmée (clôture, pas juste une mèche) du range des 5-15 premières minutes après 9h30, volume en expansion
+3) EMA9 PULLBACK (Bone Zone) — retour vers l'EMA9/EMA20 après une tendance établie, volume décroissant pendant le pullback, reprise haussière confirmée
+4) HOD BREAKOUT — cassure propre du plus haut de la séance, volume en expansion, peu de mèches
+5) FLAT TOP BREAKOUT — cassure d'un plafond testé plusieurs fois, volume à la cassure
+6) FIRST PULLBACK — le tout premier repli après le mouvement initial, setup le plus fiable si le volume diminue puis reprend
 {historical_block}{lessons_block}
-═══ MISSION ═══
-Évalue ce setup intraday selon Ross Cameron. Réponds UNIQUEMENT en JSON:
+═══ TA MISSION ═══
+1. Identifie si un de ces 6 setups est en train de se former dans les bougies ci-dessus (ou aucun) — base-toi sur la vraie structure des chandelles, pas sur des seuils fixes.
+2. Donne une conviction et une recommandation.
+3. Utilise ton jugement sur l'ensemble du contexte plutôt qu'une seule condition isolée.
+
+Réponds UNIQUEMENT en JSON:
 
 {{
   "conviction": 7,
@@ -659,6 +703,7 @@ Target 2   : ${stock_data['target2']:.2f} (3:1)
 }}
 
 conviction = 1-10 | recommendation = ACHETER / SURVEILLER / ÉVITER
+setup_type = un des 6 noms ci-dessus, ou "Aucun" si rien de valide ne se dessine
 timing = Entrée immédiate / Attendre confirmation / Trop tard
 Réponds UNIQUEMENT avec le JSON."""
 
@@ -688,7 +733,7 @@ Réponds UNIQUEMENT avec le JSON."""
         end   = content.rfind("}") + 1
         if start != -1 and end > start:
             parsed = json.loads(content[start:end])
-            log(f"  ✅ Claude → conviction={parsed.get('conviction')} reco={parsed.get('recommendation')}")
+            log(f"  ✅ Claude → conviction={parsed.get('conviction')} setup={parsed.get('setup_type')} reco={parsed.get('recommendation')}")
             return parsed
         return None
 
@@ -708,7 +753,7 @@ def format_day_message(stock_data, news, ai):
     hod      = stock_data["hod"]
     vwap     = stock_data["vwap"]
     float_m  = stock_data["float_m"]
-    setup    = stock_data["setup"]
+    setup    = ai.get("setup_type", "Aucun") if ai else "Aucun"
     vol      = stock_data["volume"]
     tv_link  = f"https://www.tradingview.com/chart/?symbol={symbol}"
     float_str = f"{float_m:.1f}M" if float_m > 0 else "N/A"
@@ -720,9 +765,9 @@ def format_day_message(stock_data, news, ai):
         timing     = escape_html(ai.get("timing", "—"))
         cat        = escape_html(ai.get("catalyst_summary", "—"))
         entry      = escape_html(ai.get("entry_zone", "—"))
-        stop       = escape_html(ai.get("stop_loss", str(stock_data["stop_loss"])))
-        t1         = escape_html(ai.get("target_1",  str(stock_data["target1"])))
-        t2         = escape_html(ai.get("target_2",  str(stock_data["target2"])))
+        stop       = escape_html(ai.get("stop_loss", str(stock_data["stop_loss_ref"])))
+        t1         = escape_html(ai.get("target_1",  str(stock_data["target1_ref"])))
+        t2         = escape_html(ai.get("target_2",  str(stock_data["target2_ref"])))
         rr         = escape_html(ai.get("risk_reward", "2:1"))
         risks      = escape_html(ai.get("risks", "—"))
         summary    = escape_html(ai.get("summary", ""))
@@ -731,7 +776,7 @@ def format_day_message(stock_data, news, ai):
         reco_emoji = "🟢" if reco == "ACHETER" else "🟡" if reco == "SURVEILLER" else "🔴"
 
         msg = (
-            f"⚔️ <b>WARRIOR DAY — {setup.upper()}</b>\n"
+            f"⚔️ <b>WARRIOR DAY — {escape_html(setup).upper()}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{conv_emoji} <b>{symbol}</b> — Conviction <b>{conviction}/10</b>\n"
             f"{reco_emoji} <b>{reco}</b> — {timing}\n\n"
@@ -845,51 +890,81 @@ def run_scan():
         log("Aucun candidat trouvé")
         return
 
-    log(f"🔍 {len(candidates)} candidats — analyse des top {min(TOP_N, len(candidates))}")
+    log(f"🔍 {len(candidates)} candidats totaux")
+
+    # Séparer les déjà-qualifiés aujourd'hui (déjà ≥5/10 lors d'un cycle
+    # précédent, déjà en watchlist locale) des nouveaux — pas besoin de
+    # refaire news + appel Claude complet sur ce qui est déjà acquis.
+    already_qualified = [c for c in candidates if c["symbol"] in qualified_today]
+    new_candidates    = [c for c in candidates if c["symbol"] not in qualified_today]
+
+    if already_qualified:
+        noms = ", ".join(f"{c['symbol']} ({qualified_today[c['symbol']]['conviction']}/10)" for c in already_qualified)
+        log(f"⏭ {len(already_qualified)} déjà qualifiés aujourd'hui, pas de nouvelle recherche: {noms}")
+
+    log(f"🔍 Analyse des top {min(TOP_N, len(new_candidates))} nouveaux candidats (sur {len(new_candidates)})")
     alerts_sent = 0
 
-    # 2. Analyser chaque candidat
-    for cand in candidates[:TOP_N]:
+    # 2. Analyser chaque NOUVEAU candidat
+    for cand in new_candidates[:TOP_N]:
         symbol = cand["symbol"]
         log(f"\n── {symbol} ──")
 
-        # Données intraday complètes + détection setup
+        # Données intraday (garde-fous opérationnels seulement — prix,
+        # liquidité — plus de détection de setup rigide ici, voir docstring
+        # de get_intraday_data)
         data = get_intraday_data(symbol)
         if not data:
-            log(f"  ✗ {symbol} — pas de setup détecté ou données insuffisantes")
             continue
 
-        log(f"  ✅ Setup: {data['setup']} | Prix ${data['price']:.2f} | "
-            f"Var {data['variation']:+.1f}% | RVOL {data['rvol']:.1f}x | HOD ${data['hod']:.2f}")
-
-        # Vérifier si on doit alerter
-        if not should_alert(symbol, data["setup"], data["price"]):
-            continue
+        log(f"  Prix ${data['price']:.2f} | Var {data['variation']:+.1f}% | "
+            f"RVOL {data['rvol']:.1f}x | HOD ${data['hod']:.2f} | VWAP ${data['vwap']:.2f}")
 
         # News
         news = get_news(symbol)
         log(f"  📰 {len(news)} news")
 
-        # Analyse Claude
+        # Analyse Claude — classification du setup + conviction
         ai = analyze_with_ai(data, news)
+        if not ai:
+            continue
+
+        setup_type = ai.get("setup_type", "Aucun")
+        if setup_type == "Aucun":
+            log(f"  ⏭ {symbol} — Claude n'identifie aucun setup valide")
+            continue
+
+        # Vérifier si on doit alerter (dédoublonnage par setup détecté par Claude)
+        if not should_alert(symbol, setup_type, data["price"]):
+            continue
 
         # Filtre conviction minimum
-        if ai and ai.get("conviction", 0) < 5:
+        if ai.get("conviction", 0) < 5:
             log(f"  ⏭ {symbol} — conviction trop faible ({ai.get('conviction')}/10)")
             continue
 
-        if ai and ai.get("recommendation") == "ÉVITER":
+        if ai.get("recommendation") == "ÉVITER":
             log(f"  ⏭ {symbol} — Claude recommande ÉVITER")
             continue
 
-        # Envoyer le signal à warrior_local.py — c'est cet appel qui manquait
-        # dans la version originale du Day Agent.
+        # Envoyer le signal à warrior_local.py
         send_webhook(data, ai)
+
+        # Marquer comme qualifié aujourd'hui — les prochains cycles ne le
+        # re-rechercheront plus (pas de news/Claude répétés), l'effort ira
+        # vers de nouveaux candidats. warrior_local.py garde le symbole en
+        # watchlist jusqu'à l'entrée ou la purge, indépendamment de ça.
+        qualified_today[symbol] = {
+            "conviction":  ai.get("conviction"),
+            "setup_type":  setup_type,
+            "qualified_at": now_et().strftime("%H:%M"),
+        }
+        save_qualified_today(qualified_today)
 
         # Envoyer alerte Telegram
         msg = format_day_message(data, news, ai)
         if send_telegram(msg):
-            mark_alerted(symbol, data["setup"], data["price"])
+            mark_alerted(symbol, setup_type, data["price"])
             alerts_sent += 1
 
         time.sleep(1)
