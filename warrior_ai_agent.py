@@ -25,6 +25,42 @@ LOCAL_WEBHOOK_URL = os.environ.get("LOCAL_WEBHOOK_URL", "")
 ET = pytz.timezone("America/New_York")
 now_et = datetime.now(ET)
 
+# ─────────────────────────────────────────────
+# SYMBOLES DÉJÀ QUALIFIÉS AUJOURD'HUI (30 juillet 2026)
+# ─────────────────────────────────────────────
+# Avant ce fix, chaque cycle de 20 min ré-analysait entièrement (news,
+# insider, short interest, appel Claude complet) les MÊMES symboles déjà
+# qualifiés ≥5/10 lors d'un cycle précédent (ex. ADVB, ZCMD, PN, LABT
+# revenaient identiques cycle après cycle) — un vrai gaspillage de temps
+# et d'appels API, puisque warrior_local.py les garde déjà en watchlist
+# jusqu'à l'entrée ou la purge de 15 min. Une fois qualifié, on ne le
+# rescanne plus : l'effort de recherche/Claude se concentre sur les
+# candidats pas encore vus, réellement nouveaux.
+QUALIFIED_FILE = os.environ.get("QUALIFIED_FILE", "qualified_today.json")
+
+def load_qualified_today() -> dict:
+    if not os.path.exists(QUALIFIED_FILE):
+        return {}
+    try:
+        with open(QUALIFIED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        today_str = now_et.strftime("%Y-%m-%d")
+        if data.get("date") != today_str:
+            return {}  # nouvelle journée — on repart à zéro
+        return data.get("symbols", {})
+    except Exception as e:
+        print(f"  ⚠ Impossible de charger {QUALIFIED_FILE}: {e}")
+        return {}
+
+def save_qualified_today(symbols: dict):
+    try:
+        with open(QUALIFIED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": now_et.strftime("%Y-%m-%d"), "symbols": symbols}, f, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Impossible de sauvegarder {QUALIFIED_FILE}: {e}")
+
+qualified_today = load_qualified_today()
+
 # Critères pre-market
 MIN_PRIX  = 0.50
 MAX_PRIX  = 20.0
@@ -378,6 +414,7 @@ def get_yahoo_data(symbol):
         prix       = float(meta_rt.get("regularMarketPrice", 0) or 0)
         prev_close = float(meta_rt.get("chartPreviousClose", 0) or 0)
         volume     = int(meta_rt.get("regularMarketVolume", 0) or 0)
+        q_rt       = res_rt[0].get("indicators", {}).get("quote", [{}])[0]
 
         # Prix pre-market
         pre_px  = float(meta_rt.get("preMarketPrice",  0) or 0)
@@ -396,8 +433,49 @@ def get_yahoo_data(symbol):
             variation = round((prix - prev_close) / prev_close * 100, 2) if prev_close else 0
             mode = "Marché"
 
+        # ── VALIDATION DU PRIX DE RÉFÉRENCE (30 juillet 2026) ──
+        # preMarketPrice/regularMarketPrice de Yahoo peuvent être un print
+        # isolé ou une valeur figée (stale), déconnectés du vrai marché —
+        # cf. leçon PN du 23 juillet ("prix 9.34 vs range réel 7.40-8.80,
+        # volumes infimes") et NUWE le 30 juillet (Railway a envoyé $4.45
+        # pendant 5h alors que le prix réel via OpenD tournait autour de
+        # $1.70-2.00). On recalcule un VWAP à partir des vraies chandelles
+        # 1min (avec volume) déjà récupérées ci-dessous, et si le prix de
+        # référence dévie trop d'un VWAP construit sur peu de volume, on
+        # le remplace par ce VWAP — plus fiable qu'un print isolé.
+        PRICE_DEVIATION_THRESHOLD = 0.10   # 10% d'écart déclenche la vérification
+        MIN_VOLUME_FOR_TRUST      = 5000   # sous ce volume cumulé, un print isolé n'est pas fiable
+
+        closes_rt = [c for c in q_rt.get("close", []) if c is not None]
+        highs_rt  = [h for h in q_rt.get("high",  []) if h is not None]
+        lows_rt   = [l for l in q_rt.get("low",   []) if l is not None]
+        vols_rt   = [v for v in q_rt.get("volume", []) if v is not None]
+
+        price_flag = None
+        if closes_rt and vols_rt and len(closes_rt) == len(vols_rt):
+            n_rt = min(len(closes_rt), len(highs_rt), len(lows_rt), len(vols_rt))
+            cum_vol_rt = sum(vols_rt[:n_rt])
+            if cum_vol_rt > 0:
+                tp_rt   = [(highs_rt[i] + lows_rt[i] + closes_rt[i]) / 3 for i in range(n_rt)]
+                vwap_rt = sum(tp_rt[i] * vols_rt[i] for i in range(n_rt)) / cum_vol_rt
+                deviation = abs(current_price - vwap_rt) / vwap_rt if vwap_rt else 0
+                if deviation > PRICE_DEVIATION_THRESHOLD and cum_vol_rt < MIN_VOLUME_FOR_TRUST:
+                    print(
+                        f"  ⚠ {symbol} prix de référence suspect: ${current_price:.2f} "
+                        f"dévie de {deviation:.0%} du VWAP réel ${vwap_rt:.2f} "
+                        f"(volume cumulé {cum_vol_rt:,} < {MIN_VOLUME_FOR_TRUST:,}) — "
+                        f"remplacé par le VWAP"
+                    )
+                    price_flag = (
+                        f"Prix original ${current_price:.2f} écarté (dévie de {deviation:.0%} "
+                        f"du VWAP réel sur volume cumulé {cum_vol_rt:,} seulement) — "
+                        f"VWAP ${vwap_rt:.2f} utilisé à la place"
+                    )
+                    variation = round((vwap_rt - prev_close) / prev_close * 100, 2) if prev_close else variation
+                    current_price = vwap_rt
+                    mode += " (prix corrigé)"
+
         # Gap overnight
-        q_rt    = res_rt[0].get("indicators", {}).get("quote", [{}])[0]
         opens   = [o for o in q_rt.get("open", []) if o is not None]
         open_px = float(opens[0]) if opens else 0.0
         gap     = round((open_px - prev_close) / prev_close * 100, 2) if (open_px and prev_close) else 0.0
@@ -421,6 +499,7 @@ def get_yahoo_data(symbol):
             "rvol":         rvol,
             "float_shares": float_shares,
             "float_m":      round(float_shares / 1_000_000, 2) if float_shares else 0,
+            "price_flag":   price_flag,
             "market_cap":   market_cap,
             "year_high":    year_high,
             "year_low":     year_low,
@@ -732,6 +811,7 @@ Volume     : {stock_data['volume']:,}
 RVOL       : {stock_data['rvol']:.1f}x
 Float      : {stock_data['float_m']:.1f}M actions (shares outstanding — float réel probablement plus bas)
 Mode       : {stock_data['mode']}
+{f"⚠ ALERTE PRIX : {stock_data['price_flag']}" if stock_data.get('price_flag') else ""}
 
 ═══ NEWS ET CATALYST ═══
 {news_text}
@@ -964,12 +1044,24 @@ if not gappers:
     print("\n  Aucun gapper trouvé.")
     exit(0)
 
-print(f"\n  {len(gappers)} gappers trouvés — analyse des top {min(TOP_N, len(gappers))}")
+print(f"\n  {len(gappers)} gappers trouvés")
 
-# 2. Analyser chaque gapper
+# Séparer les déjà-qualifiés aujourd'hui (déjà ≥5/10, déjà en watchlist
+# locale — pas besoin de re-rechercher) des nouveaux candidats à analyser.
+already_qualified = [g for g in gappers if g["symbol"] in qualified_today]
+new_candidates    = [g for g in gappers if g["symbol"] not in qualified_today]
+
+if already_qualified:
+    noms = ", ".join(f"{g['symbol']} ({qualified_today[g['symbol']]['conviction']}/10)" for g in already_qualified)
+    print(f"  ⏭ {len(already_qualified)} déjà qualifiés aujourd'hui, pas de nouvelle recherche: {noms}")
+
+print(f"  🔍 Analyse des top {min(TOP_N, len(new_candidates))} nouveaux candidats (sur {len(new_candidates)})")
+
+# 2. Analyser chaque NOUVEAU gapper (ceux déjà qualifiés restent en
+# watchlist locale sans qu'on refasse tout le travail de recherche)
 analyses = []
 
-for stock in gappers[:TOP_N]:
+for stock in new_candidates[:TOP_N]:
     symbol = stock["symbol"]
     print(f"\n  ── {symbol} ──")
 
@@ -1000,6 +1092,18 @@ for stock in gappers[:TOP_N]:
     # Envoi du signal au PC local (paper trading / exécution) via ngrok
     send_webhook(yahoo_data, ai_analysis)
 
+    # Marquer comme qualifié aujourd'hui si conviction ≥5 — les prochains
+    # cycles ne le re-rechercheront plus, l'effort ira vers de nouveaux
+    # candidats. warrior_local.py garde le symbole en watchlist jusqu'à
+    # l'entrée ou la purge de 15 min, indépendamment de nouveaux signaux.
+    if ai_analysis and ai_analysis.get("conviction", 0) >= 5:
+        qualified_today[symbol] = {
+            "conviction": ai_analysis.get("conviction"),
+            "setup_type": ai_analysis.get("setup_type", "Gap & Go"),
+            "qualified_at": now_et.strftime("%H:%M"),
+        }
+        save_qualified_today(qualified_today)
+
     analyses.append({
         "stock":    yahoo_data,
         "news":     news,
@@ -1018,12 +1122,22 @@ analyses.sort(
 
 # 4. Envoyer
 if not analyses:
-    send_telegram(
-        f"⚔️ <b>WARRIOR AI</b>\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"😴 Aucun stock ne passe les filtres Warrior ce matin.\n"
-        f"⏰ {now_et.strftime('%H:%M')} ET"
-    )
+    if already_qualified:
+        noms = ", ".join(f"{g['symbol']} ({qualified_today[g['symbol']]['conviction']}/10)" for g in already_qualified)
+        send_telegram(
+            f"⚔️ <b>WARRIOR AI</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"✅ {len(already_qualified)} déjà qualifié(s) aujourd'hui, toujours en watchlist: {noms}\n"
+            f"🔍 Aucun nouveau candidat ce cycle.\n"
+            f"⏰ {now_et.strftime('%H:%M')} ET"
+        )
+    else:
+        send_telegram(
+            f"⚔️ <b>WARRIOR AI</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"😴 Aucun stock ne passe les filtres Warrior ce matin.\n"
+            f"⏰ {now_et.strftime('%H:%M')} ET"
+        )
 else:
     summary_lines = []
     for a in analyses:
