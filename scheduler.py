@@ -1,7 +1,7 @@
 """
 ⚔️ WARRIOR SCHEDULER UNIFIÉ
 Gère les deux agents dans un seul service Railway:
-  - Pre-Market Agent → 4h00 à 9h29 ET, toutes les ~20 min puis resserré en fin de fenêtre (lundi–vendredi)
+  - Pre-Market Agent → 8h30 à 9h20 ET, toutes les 10 min (lundi–vendredi)
   - Day Trading Agent → boucle 9h30–16h00 ET (lundi–vendredi)
 """
 
@@ -51,12 +51,13 @@ def run_script(script_name):
 
 
 # ─────────────────────────────────────────────
-# PRE-MARKET — 4h00 à 9h29 ET
+# PRE-MARKET — 8h30 à 9h20 ET
 # ─────────────────────────────────────────────
-# Étendu depuis 4h00 ET (au lieu de 6h00) pour couvrir toute la fenêtre
-# active de warrior_local.py (is_market_hours() démarre à 4h00 ET).
-# Intervalle de 20 min pour respecter le quota Alpha Vantage (25 req/jour)
-# tout en priorisant la fenêtre 4h00-10h00, jugée la plus pertinente.
+# (30 juillet 2026) Ramené à 8h30-9h20 ET — le scan de 4h00-8h30 amenait
+# peu de valeur (prix pre-market souvent obsolètes/aberrants loin de
+# l'ouverture, cf. leçons ADVB/NUWE/PN) tout en consommant du quota
+# Alpha Vantage. Recentré sur la dernière heure avant l'ouverture, la
+# plus pertinente pour la fraîcheur des signaux Gap & Go.
 #
 # FIX (22 juillet 2026) : il existait un trou 9h00-9h30 ET où ni ce scan
 # pre-market (qui s'arrêtait à 9h00) ni le day agent (qui démarre à 9h30)
@@ -67,11 +68,7 @@ def run_script(script_name):
 # 09:20 pour garder une conviction fraîche jusqu'au relais du day agent
 # à 09:30.
 PREMARKET_TIMES = [
-    "04:00", "04:20", "04:40",
-    "05:00", "05:20", "05:40",
-    "06:00", "06:20", "06:40",
-    "07:00", "07:20", "07:40",
-    "08:00", "08:20", "08:40",
+    "08:30", "08:40", "08:50",
     "09:00", "09:10", "09:20"
 ]
 
@@ -166,7 +163,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 log("=" * 55)
 log("  ⚔️  WARRIOR SCHEDULER UNIFIÉ")
 log(f"  {now_et().strftime('%Y-%m-%d %H:%M')} ET")
-log("  Pre-Market : 4h00 à 9h29 ET (toutes les ~20 min, resserré à 09:10/09:20)")
+log("  Pre-Market : 8h30 à 9h20 ET (toutes les 10 min)")
 log("  Day Agent  : 9h30–16h00 ET (toutes les 5 min)")
 log("=" * 55)
 
